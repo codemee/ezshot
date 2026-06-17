@@ -66,7 +66,7 @@ Editing
 | `capture/screen.rs` | GDI BitBlt 截圖；fullscreen_rect()、active_window_rect()、window_rect(HWND)；視窗範圍優先用 DWM 可見邊界 |
 | `capture/overlay.rs` | 兩種 overlay 視窗（框選/點選），各自有內部 message loop |
 | `editor/canvas.rs` | ScreenBitmap + 標註疊加，`flatten_to_bitmap()` 輸出最終影像 |
-| `editor/tool.rs` | `Stroke` enum（Pen/Arrow/Rect/Text/Crop），各工具 GDI 繪製邏輯；`Stroke::translate()` 供裁切後座標平移 |
+| `editor/tool.rs` | `Stroke` enum（Pen/Arrow/Rect/Text），各工具 GDI 繪製邏輯；`Stroke::translate()` 供裁切後座標平移 |
 | `editor/window.rs` | 編輯器視窗：工具列、捲軸、滑鼠事件 → canvas |
 | `output/clipboard.rs` | Win32 clipboard CF_DIB 寫入（不用 arboard，HBITMAP 支援不完整） |
 | `output/file.rs` | BGRA → RGBA 轉換後用 image crate 存 PNG |
@@ -151,7 +151,7 @@ WindowFromPoint(cursor_screen) → GetDlgCtrlID → 識別是哪個按鈕
 
 ### 編輯器鍵盤快捷鍵（Alt 組合鍵）
 
-工具切換快捷鍵（`Alt+P/A/R/T/C/M`）使用 **`WM_SYSKEYDOWN`** 而非 `WM_KEYDOWN`，原因：
+工具切換快捷鍵（`Alt+P/A/R/T/M`）使用 **`WM_SYSKEYDOWN`** 而非 `WM_KEYDOWN`，原因：
 - `WM_KEYDOWN` 在中文輸入法啟用時，字母鍵訊息會先被輸入法攔截，編輯器無法收到
 - `Alt+字母` 會繞過輸入法直接產生 `WM_SYSKEYDOWN`
 
@@ -164,7 +164,7 @@ WM_SYSKEYDOWN => {
 }
 WM_SYSCHAR => {
     match wp.0 as u8 | 0x20 {  // 大小寫都吞
-        b'p' | b'a' | b'r' | b't' | b'c' | b'm' => LRESULT(0),
+        b'p' | b'a' | b'r' | b't' | b'm' => LRESULT(0),
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
@@ -219,8 +219,10 @@ if btn_down && !inside { st.done = true; DestroyWindow(hwnd); }
 `SHCreateItemFromParsingName` 的 pbc 參數型別需明確：`None::<&IBindCtx>`。  
 `IFileDialog` 方法（`SetFileName`、`SetFolder`、`SetDefaultExtension`）可直接對 `IFileSaveDialog` 呼叫（COM 繼承）。
 
-### 裁切工具與 Undo 系統
+### 控點裁切與 Undo 系統
 
+編輯區圖片邊緣常駐顯示 8 個裁切控點，拖曳邊線或角落控點即可裁切圖片；沒有獨立裁切工具列按鈕，也沒有 `Alt+C` 裁切模式。  
+控點拖曳中以 `canvas.current = Some(Stroke::Rect { r })` 顯示預覽框，放開滑鼠後呼叫 `Canvas::crop(r: RECT)`。  
 `Canvas::crop(r: RECT)` 直接修改 `self.base`，並對所有 `strokes` 呼叫 `Stroke::translate(-x, -y)` 調整座標。  
 裁切前先把完整快照推入 `undo_ops: Vec<UndoOp>`（`UndoOp::Crop { base, width, height, strokes }`），可以復原。
 

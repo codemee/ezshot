@@ -23,7 +23,8 @@ Set a delay (0 / 1 / 2 / 3 / 5 s or custom) from the tray menu to capture hover 
 
 ### Editor
 
-Each capture opens in a new tab in the persistent editor window:
+Each capture opens in a new tab in the persistent editor window.
+The image border always shows crop handles; drag an edge or corner handle to crop directly (undoable).
 
 | Tool | Description |
 |------|-------------|
@@ -31,7 +32,6 @@ Each capture opens in a new tab in the persistent editor window:
 | Arrow | Draw arrows |
 | Rectangle | Draw rectangles |
 | Text | Click to type text |
-| Crop | Drag to crop immediately (undoable) |
 | Mosaic | Drag to pixelate a region (undoable) |
 | Color / Thickness | Dropdown panel: 12 preset colors + system color picker; thickness input with line preview |
 | Copy | Copy to clipboard |
@@ -48,7 +48,6 @@ Each capture opens in a new tab in the persistent editor window:
 | `Alt+A` | Arrow |
 | `Alt+R` | Rectangle |
 | `Alt+T` | Text |
-| `Alt+C` | Crop |
 | `Alt+M` | Mosaic |
 | `Ctrl+Z` | Undo |
 | `Ctrl+C` | Copy to clipboard |

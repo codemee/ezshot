@@ -47,7 +47,7 @@ impl Canvas {
     }
 
     /// Render everything onto `hdc` (should be a compat DC of the same size).
-    /// `crop_mode`：裁切工具拖曳中，current stroke 改用固定白色 1px（與繪圖顏色無關）
+    /// `crop_mode`：裁切控點或區域效果拖曳中，current stroke 改用固定白色 1px（與繪圖顏色無關）
     pub unsafe fn render(&self, hdc: HDC, screen_dc: HDC, crop_mode: bool) {
         // Paint base bitmap into hdc via a temp DC
         let mem_dc = CreateCompatibleDC(screen_dc);
