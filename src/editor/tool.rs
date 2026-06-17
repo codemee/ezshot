@@ -10,7 +10,6 @@ pub enum Tool {
     Arrow,
     Rect,
     Text,
-    Crop,
     Mosaic,
 }
 

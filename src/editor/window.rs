@@ -66,13 +66,28 @@ const BTN_PEN: usize   = 10;
 const BTN_ARROW: usize = 11;
 const BTN_RECT: usize  = 12;
 const BTN_TEXT: usize  = 13;
-const BTN_CROP:   usize = 14;
 const BTN_COLOR:  usize = 15;
 const BTN_MOSAIC: usize = 17;
 const BTN_COPY:    usize = 20;
 const BTN_SAVE:    usize = 21;
 const BTN_SAVEAS:  usize = 23;
 const BTN_UNDO:    usize = 22;
+
+const CROP_HANDLE_SIZE: i32 = 9;
+const CROP_HANDLE_HIT: i32 = 7;
+const CROP_MIN_SIZE: i32 = 5;
+
+#[derive(Clone, Copy, PartialEq)]
+enum CropHandle {
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+}
 
 /// 每個分頁各自擁有的狀態
 struct TabInfo {
@@ -95,6 +110,8 @@ struct EditorState {
     tab_counter: u32,
     active_tool: Tool,
     dragging: bool,
+    crop_handle: Option<CropHandle>,
+    hover_crop_handle: Option<CropHandle>,
     drag_start: POINT,
     default_save_dir: std::path::PathBuf,
     hovering_canvas: bool,
@@ -138,7 +155,7 @@ pub fn open(
 
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let min_w = BTN_MARGIN + 14 * (BTN_W + BTN_MARGIN) + 20;
+        let min_w = BTN_MARGIN + 13 * (BTN_W + BTN_MARGIN) + 20;
         let min_h = CANVAS_Y + 120;
 
         let (initial_tabs, win_w, win_h) = if let Some(bmp) = bmp {
@@ -169,6 +186,8 @@ pub fn open(
             tab_counter: 1,
             active_tool: Tool::Pen,
             dragging: false,
+            crop_handle: None,
+            hover_crop_handle: None,
             drag_start: POINT { x: 0, y: 0 },
             default_save_dir: save_dir,
             hovering_canvas: false,
@@ -262,7 +281,7 @@ pub fn open(
 
 unsafe fn create_toolbar(parent: HWND) {
     let hinstance = get_instance();
-    for (i, id) in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP, BTN_MOSAIC, BTN_COLOR, BTN_COPY, BTN_SAVE, BTN_SAVEAS, BTN_UNDO, BTN_ZOOM_OUT, BTN_ZOOM_IN, BTN_SETTINGS]
+    for (i, id) in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_MOSAIC, BTN_COLOR, BTN_COPY, BTN_SAVE, BTN_SAVEAS, BTN_UNDO, BTN_ZOOM_OUT, BTN_ZOOM_IN, BTN_SETTINGS]
         .iter().enumerate()
     {
         let x = BTN_MARGIN + i as i32 * (BTN_W + BTN_MARGIN);
@@ -345,6 +364,153 @@ unsafe fn update_scrollbars(hwnd: HWND, state: &EditorState) {
 fn clamp_scroll_z(val: i32, canvas_size: i32, client_size: i32, zoom: f32) -> i32 {
     let max_scroll = (canvas_size as f32 - client_size as f32 / zoom).max(0.0) as i32;
     val.clamp(0, max_scroll)
+}
+
+fn active_canvas_rect(tab: &TabInfo) -> RECT {
+    RECT {
+        left: 0,
+        top: 0,
+        right: tab.canvas.width,
+        bottom: tab.canvas.height,
+    }
+}
+
+fn canvas_rect_to_client(tab: &TabInfo, r: RECT) -> RECT {
+    let z = tab.zoom;
+    RECT {
+        left: ((r.left - tab.scroll_x) as f32 * z) as i32,
+        top: CANVAS_Y + ((r.top - tab.scroll_y) as f32 * z) as i32,
+        right: ((r.right - tab.scroll_x) as f32 * z) as i32,
+        bottom: CANVAS_Y + ((r.bottom - tab.scroll_y) as f32 * z) as i32,
+    }
+}
+
+fn client_point_to_canvas(tab: &TabInfo, x: i32, y: i32) -> POINT {
+    POINT {
+        x: (x as f32 / tab.zoom) as i32 + tab.scroll_x,
+        y: ((y - CANVAS_Y) as f32 / tab.zoom) as i32 + tab.scroll_y,
+    }
+}
+
+fn crop_rect_from_handle(handle: CropHandle, canvas: RECT, pt: POINT) -> RECT {
+    let max_left = canvas.right - CROP_MIN_SIZE;
+    let min_right = canvas.left + CROP_MIN_SIZE;
+    let max_top = canvas.bottom - CROP_MIN_SIZE;
+    let min_bottom = canvas.top + CROP_MIN_SIZE;
+
+    let mut r = canvas;
+    match handle {
+        CropHandle::TopLeft => {
+            r.left = pt.x.clamp(canvas.left, max_left);
+            r.top = pt.y.clamp(canvas.top, max_top);
+        }
+        CropHandle::Top => {
+            r.top = pt.y.clamp(canvas.top, max_top);
+        }
+        CropHandle::TopRight => {
+            r.right = pt.x.clamp(min_right, canvas.right);
+            r.top = pt.y.clamp(canvas.top, max_top);
+        }
+        CropHandle::Right => {
+            r.right = pt.x.clamp(min_right, canvas.right);
+        }
+        CropHandle::BottomRight => {
+            r.right = pt.x.clamp(min_right, canvas.right);
+            r.bottom = pt.y.clamp(min_bottom, canvas.bottom);
+        }
+        CropHandle::Bottom => {
+            r.bottom = pt.y.clamp(min_bottom, canvas.bottom);
+        }
+        CropHandle::BottomLeft => {
+            r.left = pt.x.clamp(canvas.left, max_left);
+            r.bottom = pt.y.clamp(min_bottom, canvas.bottom);
+        }
+        CropHandle::Left => {
+            r.left = pt.x.clamp(canvas.left, max_left);
+        }
+    }
+    r
+}
+
+fn handle_centers(r: RECT) -> [(CropHandle, POINT); 8] {
+    let mx = (r.left + r.right) / 2;
+    let my = (r.top + r.bottom) / 2;
+    [
+        (CropHandle::TopLeft, POINT { x: r.left, y: r.top }),
+        (CropHandle::Top, POINT { x: mx, y: r.top }),
+        (CropHandle::TopRight, POINT { x: r.right, y: r.top }),
+        (CropHandle::Right, POINT { x: r.right, y: my }),
+        (CropHandle::BottomRight, POINT { x: r.right, y: r.bottom }),
+        (CropHandle::Bottom, POINT { x: mx, y: r.bottom }),
+        (CropHandle::BottomLeft, POINT { x: r.left, y: r.bottom }),
+        (CropHandle::Left, POINT { x: r.left, y: my }),
+    ]
+}
+
+fn point_near(p: POINT, center: POINT, radius: i32) -> bool {
+    (p.x - center.x).abs() <= radius && (p.y - center.y).abs() <= radius
+}
+
+fn hit_crop_handle(tab: &TabInfo, x: i32, y: i32) -> Option<CropHandle> {
+    let crop_rect = if let Some(Stroke::Rect { r }) = tab.canvas.current.as_ref() {
+        *r
+    } else {
+        active_canvas_rect(tab)
+    };
+    let client_rect = canvas_rect_to_client(tab, crop_rect);
+    let pt = POINT { x, y };
+    for (handle, center) in handle_centers(client_rect) {
+        if point_near(pt, center, CROP_HANDLE_HIT) {
+            return Some(handle);
+        }
+    }
+    None
+}
+
+unsafe fn draw_crop_handles(hdc: windows::Win32::Graphics::Gdi::HDC, tab: &TabInfo) {
+    let crop_rect = if let Some(Stroke::Rect { r }) = tab.canvas.current.as_ref() {
+        *r
+    } else {
+        active_canvas_rect(tab)
+    };
+    let r = canvas_rect_to_client(tab, crop_rect);
+
+    let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00_00_78_D4));
+    let old_pen = SelectObject(hdc, pen);
+    let null_brush = GetStockObject(NULL_BRUSH);
+    let old_brush = SelectObject(hdc, null_brush);
+    GdiRectangle(hdc, r.left, r.top, r.right, r.bottom);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    DeleteObject(pen);
+
+    let fill = CreateSolidBrush(COLORREF(0x00_FF_FF_FF));
+    let border = CreatePen(PS_SOLID, 1, COLORREF(0x00_00_78_D4));
+    let old_fill = SelectObject(hdc, fill);
+    let old_border = SelectObject(hdc, border);
+    let half = CROP_HANDLE_SIZE / 2;
+    for (_, center) in handle_centers(r) {
+        GdiRectangle(
+            hdc,
+            center.x - half,
+            center.y - half,
+            center.x + half + 1,
+            center.y + half + 1,
+        );
+    }
+    SelectObject(hdc, old_fill);
+    SelectObject(hdc, old_border);
+    DeleteObject(fill);
+    DeleteObject(border);
+}
+
+fn cursor_for_crop_handle(handle: CropHandle) -> windows::core::PCWSTR {
+    match handle {
+        CropHandle::TopLeft | CropHandle::BottomRight => IDC_SIZENWSE,
+        CropHandle::TopRight | CropHandle::BottomLeft => IDC_SIZENESW,
+        CropHandle::Top | CropHandle::Bottom => IDC_SIZENS,
+        CropHandle::Left | CropHandle::Right => IDC_SIZEWE,
+    }
 }
 
 unsafe extern "system" fn editor_wnd_proc(
@@ -475,7 +641,7 @@ unsafe extern "system" fn editor_wnd_proc(
             let id = (wp.0 & 0xFFFF) as usize;
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
             match id {
-                BTN_PEN | BTN_ARROW | BTN_RECT | BTN_TEXT | BTN_CROP | BTN_MOSAIC => {
+                BTN_PEN | BTN_ARROW | BTN_RECT | BTN_TEXT | BTN_MOSAIC => {
                     if state.tabs.is_empty() { return LRESULT(0); }
                     state.active_tool = match id {
                         BTN_PEN    => Tool::Pen,
@@ -483,9 +649,9 @@ unsafe extern "system" fn editor_wnd_proc(
                         BTN_RECT   => Tool::Rect,
                         BTN_TEXT   => Tool::Text,
                         BTN_MOSAIC => Tool::Mosaic,
-                        _          => Tool::Crop,
+                        _          => Tool::Pen,
                     };
-                    for bid in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP, BTN_MOSAIC] {
+                    for bid in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_MOSAIC] {
                         if let Ok(btn) = GetDlgItem(hwnd, bid as i32) {
                             InvalidateRect(btn, None, false);
                         }
@@ -678,7 +844,6 @@ unsafe extern "system" fn editor_wnd_proc(
                 0x41 => Some(BTN_ARROW),  // Alt+A
                 0x52 => Some(BTN_RECT),   // Alt+R
                 0x54 => Some(BTN_TEXT),   // Alt+T
-                0x43 => Some(BTN_CROP),   // Alt+C
                 0x4D => Some(BTN_MOSAIC), // Alt+M
                 _ => None,
             };
@@ -691,7 +856,7 @@ unsafe extern "system" fn editor_wnd_proc(
         WM_SYSCHAR => {
             // 吞掉 Alt+字母 產生的 SYSCHAR，避免 DefWindowProcW 因無對應選單而發出提示音
             match wp.0 as u8 | 0x20 {
-                b'p' | b'a' | b'r' | b't' | b'c' | b'm' => LRESULT(0),
+                b'p' | b'a' | b'r' | b't' | b'm' => LRESULT(0),
                 _ => DefWindowProcW(hwnd, msg, wp, lp),
             }
         }
@@ -801,6 +966,17 @@ unsafe extern "system" fn editor_wnd_proc(
             let cy_canvas = cy - CANVAS_Y;
             if cy_canvas < 0 { return LRESULT(0); }
             if state.tabs.is_empty() { return LRESULT(0); }
+            if let Some(handle) = hit_crop_handle(&state.tabs[state.active_tab], cx, cy) {
+                let tab = &mut state.tabs[state.active_tab];
+                state.dragging = true;
+                state.crop_handle = Some(handle);
+                state.drag_start = client_point_to_canvas(tab, cx, cy);
+                tab.canvas.current = Some(Stroke::Rect { r: active_canvas_rect(tab) });
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, Some(&RECT { left: 0, top: CANVAS_Y,
+                    right: 32767, bottom: 32767 }), false);
+                return LRESULT(0);
+            }
             // screen → canvas 座標（計入縮放與捲動偏移）
             let zoom = state.tabs[state.active_tab].zoom;
             let pt = POINT {
@@ -839,8 +1015,13 @@ unsafe extern "system" fn editor_wnd_proc(
         }
         WM_MOUSEMOVE => {
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
-            let (_, cy_mm) = client_xy(lp);
+            let (cx_mm, cy_mm) = client_xy(lp);
             state.hovering_canvas = cy_mm >= CANVAS_Y;
+            state.hover_crop_handle = if state.tabs.is_empty() {
+                None
+            } else {
+                hit_crop_handle(&state.tabs[state.active_tab], cx_mm, cy_mm)
+            };
             if !state.dragging { return LRESULT(0); }
             let (cx, cy) = client_xy(lp);
             let zoom = state.tabs[state.active_tab].zoom;
@@ -848,7 +1029,13 @@ unsafe extern "system" fn editor_wnd_proc(
                 x: (cx as f32 / zoom) as i32 + state.tabs[state.active_tab].scroll_x,
                 y: ((cy - CANVAS_Y) as f32 / zoom) as i32 + state.tabs[state.active_tab].scroll_y,
             };
-            match state.active_tool {
+            if let Some(handle) = state.crop_handle {
+                let canvas_rect = active_canvas_rect(&state.tabs[state.active_tab]);
+                let pt = client_point_to_canvas(&state.tabs[state.active_tab], cx_mm, cy_mm);
+                state.tabs[state.active_tab].canvas.current =
+                    Some(Stroke::Rect { r: crop_rect_from_handle(handle, canvas_rect, pt) });
+            } else {
+                match state.active_tool {
                 Tool::Pen => {
                     if let Some(Stroke::Pen { ref mut points }) = state.tabs[state.active_tab].canvas.current {
                         points.push(pt);
@@ -857,7 +1044,7 @@ unsafe extern "system" fn editor_wnd_proc(
                 Tool::Arrow => {
                     state.tabs[state.active_tab].canvas.current = Some(Stroke::Arrow { from: state.drag_start, to: pt });
                 }
-                Tool::Rect | Tool::Crop | Tool::Mosaic => {
+                Tool::Rect | Tool::Mosaic => {
                     let s = state.drag_start;
                     state.tabs[state.active_tab].canvas.current = Some(Stroke::Rect {
                         r: RECT {
@@ -867,6 +1054,7 @@ unsafe extern "system" fn editor_wnd_proc(
                     });
                 }
                 _ => {}
+                }
             }
             // 只刷畫布區域（CANVAS_Y 以下），避免工具列＋標籤列重繪閃爍
             InvalidateRect(hwnd, Some(&RECT { left: 0, top: CANVAS_Y,
@@ -878,21 +1066,27 @@ unsafe extern "system" fn editor_wnd_proc(
             if state.dragging {
                 state.dragging = false;
                 ReleaseCapture().unwrap();
-                if state.active_tool == Tool::Crop {
-                    // 取得裁切矩形後直接套用
+                if state.crop_handle.take().is_some() {
                     if let Some(Stroke::Rect { r }) = state.tabs[state.active_tab].canvas.current.take() {
-                        if r.right - r.left > 4 && r.bottom - r.top > 4 {
+                        let full = active_canvas_rect(&state.tabs[state.active_tab]);
+                        if (r.right - r.left) >= CROP_MIN_SIZE
+                            && (r.bottom - r.top) >= CROP_MIN_SIZE
+                            && (r.left != full.left || r.top != full.top
+                                || r.right != full.right || r.bottom != full.bottom)
+                        {
                             state.tabs[state.active_tab].canvas.crop(r);
                             state.tabs[state.active_tab].scroll_x = 0;
                             state.tabs[state.active_tab].scroll_y = 0;
                             if !state.tabs[state.active_tab].modified {
                                 state.tabs[state.active_tab].modified = true;
+                                InvalidateRect(hwnd, Some(&RECT{left:0,top:TOOLBAR_H,right:32767,bottom:CANVAS_Y}), false);
                             }
                         }
                     }
                     state.tabs[state.active_tab].canvas.current = None;
                     update_scrollbars(hwnd, state);
                     InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
                 } else if state.active_tool == Tool::Mosaic {
                     // 套用馬賽克
                     if let Some(Stroke::Rect { r }) = state.tabs[state.active_tab].canvas.current.take() {
@@ -1060,7 +1254,7 @@ unsafe extern "system" fn editor_wnd_proc(
                     state.tabs[state.active_tab].canvas.height);
                 let old_canvas = SelectObject(canvas_dc, canvas_bmp);
                 state.tabs[state.active_tab].canvas.render(canvas_dc, screen_dc,
-                    matches!(state.active_tool, Tool::Crop | Tool::Mosaic));
+                    state.crop_handle.is_some() || matches!(state.active_tool, Tool::Mosaic));
 
                 let zoom = state.tabs[state.active_tab].zoom;
                 // 計算來源（canvas 像素）與目的（螢幕像素）區域
@@ -1086,6 +1280,7 @@ unsafe extern "system" fn editor_wnd_proc(
                 DeleteDC(canvas_dc);
 
                 BitBlt(hdc, 0, CANVAS_Y, client_w, client_h, buf_dc, 0, 0, SRCCOPY).unwrap();
+                draw_crop_handles(hdc, &state.tabs[state.active_tab]);
 
                 SelectObject(buf_dc, old_buf);
                 DeleteObject(buf_bmp);
@@ -1107,7 +1302,6 @@ unsafe extern "system" fn editor_wnd_proc(
                 (id == BTN_ARROW && state.active_tool == Tool::Arrow)  ||
                 (id == BTN_RECT  && state.active_tool == Tool::Rect)   ||
                 (id == BTN_TEXT  && state.active_tool == Tool::Text)   ||
-                (id == BTN_CROP   && state.active_tool == Tool::Crop)   ||
                 (id == BTN_MOSAIC && state.active_tool == Tool::Mosaic);
 
             // COLORREF = 0x00BBGGRR
@@ -1199,39 +1393,33 @@ unsafe extern "system" fn editor_wnd_proc(
                     DeleteObject(lb);
                 }
                 BTN_MOSAIC => {
-                    // 3×3 像素方格（馬賽克圖示）
-                    let s = 3i32; // 每格大小
-                    let g = 2i32; // 格間距
-                    let total = 3 * s + 2 * g;
-                    let ox = cx - total / 2;
-                    let oy = cy - total / 2;
-                    for gy in 0..3i32 {
-                        for gx in 0..3i32 {
-                            let rx = ox + gx * (s + g);
-                            let ry = oy + gy * (s + g);
-                            // 棋盤交錯：奇偶格填滿或空心，製造馬賽克視覺
-                            if (gx + gy) % 2 == 0 {
-                                GdiRectangle(hdc, rx, ry, rx+s, ry+s);
-                            } else {
-                                let o = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                                GdiRectangle(hdc, rx, ry, rx+s, ry+s);
-                                SelectObject(hdc, o);
-                            }
+                    // 兩排交錯灰階小方格，維持簡潔的工具列圖示風格
+                    let s = 5i32;
+                    let gap = 2i32;
+                    let ox = cx - (3 * s + 2 * gap) / 2;
+                    let oy = cy - (2 * s + gap) / 2;
+                    let shades = [
+                        COLORREF(0x00_40_40_40),
+                        COLORREF(0x00_90_90_90),
+                        COLORREF(0x00_D0_D0_D0),
+                        COLORREF(0x00_B0_B0_B0),
+                        COLORREF(0x00_60_60_60),
+                        COLORREF(0x00_E8_E8_E8),
+                    ];
+                    for row in 0..2i32 {
+                        for col in 0..3i32 {
+                            let left = ox + col * (s + gap);
+                            let top = oy + row * (s + gap);
+                            let brush = CreateSolidBrush(shades[(row * 3 + col) as usize]);
+                            FillRect(hdc, &RECT {
+                                left,
+                                top,
+                                right: left + s,
+                                bottom: top + s,
+                            }, brush);
+                            DeleteObject(brush);
                         }
                     }
-                }
-                BTN_CROP => {
-                    let o = SelectObject(hdc, nb);
-                    let _ = GdiRectangle(hdc, cx-5, cy-5, cx+5, cy+5);
-                    SelectObject(hdc, o);
-                    let _ = MoveToEx(hdc, cx-5, cy-8, None); let _ = LineTo(hdc, cx-5, cy-5);
-                    let _ = MoveToEx(hdc, cx-8, cy-5, None); let _ = LineTo(hdc, cx-5, cy-5);
-                    let _ = MoveToEx(hdc, cx+5, cy-8, None); let _ = LineTo(hdc, cx+5, cy-5);
-                    let _ = MoveToEx(hdc, cx+8, cy-5, None); let _ = LineTo(hdc, cx+5, cy-5);
-                    let _ = MoveToEx(hdc, cx-5, cy+8, None); let _ = LineTo(hdc, cx-5, cy+5);
-                    let _ = MoveToEx(hdc, cx-8, cy+5, None); let _ = LineTo(hdc, cx-5, cy+5);
-                    let _ = MoveToEx(hdc, cx+5, cy+8, None); let _ = LineTo(hdc, cx+5, cy+5);
-                    let _ = MoveToEx(hdc, cx+8, cy+5, None); let _ = LineTo(hdc, cx+5, cy+5);
                 }
                 BTN_COPY => {
                     let o = SelectObject(hdc, nb);
@@ -1310,8 +1498,8 @@ unsafe extern "system" fn editor_wnd_proc(
             let btn_hover: i32 = if under.is_invalid() { -1 } else {
                 match GetDlgCtrlID(under) as usize {
                     BTN_PEN   => 0, BTN_ARROW => 1, BTN_RECT  => 2, BTN_TEXT  => 3,
-                    BTN_CROP => 4, BTN_MOSAIC => 5, BTN_COLOR => 6, BTN_COPY => 7,
-                    BTN_SAVE => 8, BTN_SAVEAS => 9, BTN_UNDO => 10, BTN_ZOOM_OUT => 11, BTN_ZOOM_IN => 12, BTN_SETTINGS => 13, _ => -1,
+                    BTN_MOSAIC => 4, BTN_COLOR => 5, BTN_COPY => 6,
+                    BTN_SAVE => 7, BTN_SAVEAS => 8, BTN_UNDO => 9, BTN_ZOOM_OUT => 10, BTN_ZOOM_IN => 11, BTN_SETTINGS => 12, _ => -1,
                 }
             };
             if btn_hover != state.hover_btn {
@@ -1326,7 +1514,6 @@ unsafe extern "system" fn editor_wnd_proc(
                         (crate::i18n::t("箭頭","Arrow"),      "Alt+A"),
                         (crate::i18n::t("矩形","Rect"),       "Alt+R"),
                         (crate::i18n::t("文字","Text"),       "Alt+T"),
-                        (crate::i18n::t("裁切","Crop"),       "Alt+C"),
                         (crate::i18n::t("馬賽克","Mosaic"),   "Alt+M"),
                         (crate::i18n::t("顏色","Color"),      ""),
                         (crate::i18n::t("複製","Copy"),       "Ctrl+C"),
@@ -1367,9 +1554,13 @@ unsafe extern "system" fn editor_wnd_proc(
                     let state = &*ptr;
                     // hovering_canvas 由 WM_MOUSEMOVE 維護，避免使用不在 glob 中的 ScreenToClient
                     if state.hovering_canvas {
-                        let cursor_id = match state.active_tool {
-                            Tool::Text => IDC_IBEAM,
-                            _          => IDC_CROSS,
+                        let cursor_id = if let Some(handle) = state.crop_handle.or(state.hover_crop_handle) {
+                            cursor_for_crop_handle(handle)
+                        } else {
+                            match state.active_tool {
+                                Tool::Text => IDC_IBEAM,
+                                _          => IDC_CROSS,
+                            }
                         };
                         SetCursor(LoadCursorW(None, cursor_id).unwrap());
                         return LRESULT(1);
