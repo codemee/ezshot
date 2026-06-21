@@ -987,6 +987,14 @@ unsafe extern "system" fn editor_wnd_proc(
                 x: (cx as f32 / zoom) as i32 + state.tabs[state.active_tab].scroll_x,
                 y: (cy_canvas as f32 / zoom) as i32 + state.tabs[state.active_tab].scroll_y,
             };
+            // 圖片範圍外不啟動工具
+            let (img_w, img_h) = {
+                let tab = &state.tabs[state.active_tab];
+                (tab.canvas.width, tab.canvas.height)
+            };
+            if pt.x < 0 || pt.y < 0 || pt.x >= img_w || pt.y >= img_h {
+                return LRESULT(0);
+            }
 
             match state.active_tool {
                 Tool::Text => {
@@ -2017,6 +2025,87 @@ fn client_xy(lp: LPARAM) -> (i32, i32) {
     (x, y)
 }
 
+/// Combobox subclass proc：WM_PAINT 後覆蓋 3D 邊框和下拉按鈕，改成 1px 扁平外觀
+unsafe extern "system" fn flat_combo_subproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let orig = GetPropW(hwnd, w!("_op")).0 as isize;
+    let orig_fn: Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT> =
+        if orig != 0 { Some(std::mem::transmute(orig)) } else { None };
+    let call_orig = |w2: WPARAM, l2: LPARAM| match orig_fn {
+        Some(f) => CallWindowProcW(Some(f), hwnd, msg, w2, l2),
+        None    => DefWindowProcW(hwnd, msg, w2, l2),
+    };
+    if msg == 0x000F /* WM_PAINT */ {
+        let r = call_orig(wp, lp);
+        let mut rc = RECT::default();
+        GetClientRect(hwnd, &mut rc);
+        let (cw, ch) = (rc.right, rc.bottom);
+        if cw > 0 && ch > 0 {
+            let hdc = GetDC(hwnd);
+            if !hdc.0.is_null() {
+                let c      = crate::theme::colors();
+                let bg     = c.toolbar_bg;
+                let border = c.canvas_bg;
+                let bg_b   = CreateSolidBrush(COLORREF(bg));
+
+                // 抹去 3D 外框（2px）
+                for rc2 in [
+                    RECT { left: 0,    top: 0,    right: cw,   bottom: 2    },
+                    RECT { left: 0,    top: ch-2, right: cw,   bottom: ch   },
+                    RECT { left: 0,    top: 0,    right: 2,    bottom: ch   },
+                    RECT { left: cw-2, top: 0,    right: cw,   bottom: ch   },
+                ] { FillRect(hdc, &rc2, bg_b); }
+
+                // 覆蓋下拉按鈕區域（原本是 3D 凸起）
+                let btn_w = GetSystemMetrics(SM_CXVSCROLL);
+                let btn_l = cw - btn_w;
+                let btn_rc = RECT { left: btn_l, top: 1, right: cw - 1, bottom: ch - 1 };
+                FillRect(hdc, &btn_rc, bg_b);
+                DeleteObject(bg_b);
+
+                // 按鈕左側分隔線
+                let sep = CreatePen(PS_SOLID, 1, COLORREF(border));
+                let op  = SelectObject(hdc, sep);
+                MoveToEx(hdc, btn_l, 2, None);
+                LineTo(hdc, btn_l, ch - 2);
+                SelectObject(hdc, op);
+                DeleteObject(sep);
+
+                // 向下三角形箭頭（填色多邊形）
+                let btn_cx = btn_l + (cw - 1 - btn_l) / 2;
+                let btn_cy = ch / 2;
+                let aw = 4i32; // half-width
+                let ah = 4i32; // height
+                let tri = [
+                    POINT { x: btn_cx - aw, y: btn_cy - ah / 2 },
+                    POINT { x: btn_cx + aw, y: btn_cy - ah / 2 },
+                    POINT { x: btn_cx,      y: btn_cy + ah / 2 + 1 },
+                ];
+                let tri_brush = CreateSolidBrush(COLORREF(c.tab_text_inactive));
+                let tri_pen   = CreatePen(PS_SOLID, 1, COLORREF(c.tab_text_inactive));
+                let ob2 = SelectObject(hdc, tri_brush);
+                let op2 = SelectObject(hdc, tri_pen);
+                Polygon(hdc, &tri);
+                SelectObject(hdc, ob2);
+                SelectObject(hdc, op2);
+                DeleteObject(tri_brush);
+                DeleteObject(tri_pen);
+
+                // 1px 扁平外框
+                let pen = CreatePen(PS_SOLID, 1, COLORREF(border));
+                let op  = SelectObject(hdc, pen);
+                let ob  = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                GdiRectangle(hdc, 0, 0, cw, ch);
+                SelectObject(hdc, op);
+                SelectObject(hdc, ob);
+                DeleteObject(pen);
+                ReleaseDC(hwnd, hdc);
+            }
+        }
+        return r;
+    }
+    call_orig(wp, lp)
+}
+
 unsafe fn simple_input_dialog(
     parent: HWND,
     default_font: &str,
@@ -2095,6 +2184,17 @@ unsafe fn simple_input_dialog(
                     WS_CHILD|WS_VISIBLE|WINDOW_STYLE(2|WS_VSCROLL.0),
                     352, TH+8, 60, 200, hwnd, HMENU(4usize as *mut _), hi, None)
                     .unwrap_or(HWND(std::ptr::null_mut()));
+                // 移除視覺主題 + subclass 覆蓋邊框，使 combobox 呈現 1px 扁平方格外觀
+                if !fcb.0.is_null() {
+                    let _ = windows::Win32::UI::Controls::SetWindowTheme(fcb, w!(""), w!(""));
+                    let op = SetWindowLongPtrW(fcb, GWLP_WNDPROC, flat_combo_subproc as *const () as isize);
+                    SetPropW(fcb, w!("_op"), windows::Win32::Foundation::HANDLE(op as *mut _));
+                }
+                if !scb.0.is_null() {
+                    let _ = windows::Win32::UI::Controls::SetWindowTheme(scb, w!(""), w!(""));
+                    let op = SetWindowLongPtrW(scb, GWLP_WNDPROC, flat_combo_subproc as *const () as isize);
+                    SetPropW(scb, w!("_op"), windows::Win32::Foundation::HANDLE(op as *mut _));
+                }
                 // 文字輸入框（ID=100, ES_AUTOHSCROLL=0x80）
                 let edit = CreateWindowExW(Default::default(), w!("EDIT"), w!(""),
                     WS_CHILD|WS_VISIBLE|WS_BORDER|WINDOW_STYLE(0x0080),

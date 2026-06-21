@@ -31,7 +31,7 @@ The image border always shows crop handles; drag an edge or corner handle to cro
 | Pen | Freehand drawing |
 | Arrow | Draw arrows |
 | Rectangle | Draw rectangles |
-| Text | Click to type text; choose font family and size |
+| Text | Click within the image to type text; choose font family and size |
 | Mosaic | Drag to pixelate a region (undoable) |
 | Color / Thickness | Dropdown panel: 12 preset colors + system color picker; thickness input with line preview |
 | Copy | Copy to clipboard |

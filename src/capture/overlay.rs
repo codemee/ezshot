@@ -373,7 +373,7 @@ unsafe fn find_window_at(overlay: HWND, pt: POINT) -> HWND {
         if hwnd == ctx.overlay { return BOOL(1); }
         if !IsWindowVisible(hwnd).as_bool() { return BOOL(1); }
         if is_desktop_window(hwnd) { return BOOL(1); }
-        if !is_pickable_app_window(hwnd) { return BOOL(1); }
+        if is_cloaked_window(hwnd) { return BOOL(1); }
 
         let Some(rc) = visible_window_rect(hwnd) else { return BOOL(1); };
         let pt = ctx.pt;
@@ -508,48 +508,6 @@ unsafe fn is_desktop_window(hwnd: HWND) -> bool {
         String::from_utf16_lossy(&cls[..cn]).as_str(),
         "Progman" | "WorkerW"
     )
-}
-
-unsafe fn is_pickable_app_window(hwnd: HWND) -> bool {
-    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-    if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
-        return false;
-    }
-    if GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| !owner.is_invalid()) {
-        return false;
-    }
-    if is_cloaked_window(hwnd) {
-        return false;
-    }
-    if !is_alt_tab_window(hwnd) {
-        return false;
-    }
-    if (ex_style & WS_EX_APPWINDOW.0) != 0 {
-        return true;
-    }
-
-    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-    GetWindowTextLengthW(hwnd) > 0 && (style & WS_SYSMENU.0) != 0
-}
-
-unsafe fn is_alt_tab_window(hwnd: HWND) -> bool {
-    let mut walk = GetAncestor(hwnd, GA_ROOTOWNER);
-    if walk.is_invalid() {
-        walk = hwnd;
-    }
-
-    loop {
-        let try_hwnd = GetLastActivePopup(walk);
-        if try_hwnd == walk {
-            break;
-        }
-        if IsWindowVisible(try_hwnd).as_bool() {
-            break;
-        }
-        walk = try_hwnd;
-    }
-
-    walk == hwnd
 }
 
 unsafe fn is_cloaked_window(hwnd: HWND) -> bool {
