@@ -121,6 +121,8 @@ struct EditorState {
     tab_scroll: usize,
     editor_hwnd_arc: std::sync::Arc<std::sync::Mutex<Option<isize>>>,
     config: std::sync::Arc<std::sync::Mutex<crate::config::Config>>,
+    text_font: String,
+    text_size: i32,
 }
 
 pub fn open(
@@ -197,6 +199,8 @@ pub fn open(
             tab_scroll: 0,
             editor_hwnd_arc: editor_hwnd_arc.clone(),
             config: config.clone(),
+            text_font: "微軟正黑體".to_string(),
+            text_size: 24,
         });
 
         let hwnd = match CreateWindowExW(
@@ -986,16 +990,19 @@ unsafe extern "system" fn editor_wnd_proc(
 
             match state.active_tool {
                 Tool::Text => {
-                    let text = simple_input_dialog(hwnd);
-                    if !text.is_empty() {
+                    let df = state.text_font.clone();
+                    let ds = state.text_size;
+                    if let Some((text, font, size)) = simple_input_dialog(hwnd, &df, ds) {
                         let (c, t) = {
                             let tab = &state.tabs[state.active_tab];
                             (tab.canvas.tool_color, tab.canvas.tool_thickness)
                         };
-                        state.tabs[state.active_tab].canvas.strokes.push((
-                            Stroke::Text { pos: pt, text },
+                        state.text_font = font.clone();
+                        state.text_size = size;
+                        state.tabs[state.active_tab].canvas.push_stroke(
+                            Stroke::Text { pos: pt, text, font, size },
                             super::tool::Color(c), t,
-                        ));
+                        );
                         if !state.tabs[state.active_tab].modified {
                             state.tabs[state.active_tab].modified = true;
                         }
@@ -1393,33 +1400,23 @@ unsafe extern "system" fn editor_wnd_proc(
                     DeleteObject(lb);
                 }
                 BTN_MOSAIC => {
-                    // 兩排交錯灰階小方格，維持簡潔的工具列圖示風格
-                    let s = 5i32;
-                    let gap = 2i32;
-                    let ox = cx - (3 * s + 2 * gap) / 2;
-                    let oy = cy - (2 * s + gap) / 2;
-                    let shades = [
-                        COLORREF(0x00_40_40_40),
-                        COLORREF(0x00_90_90_90),
-                        COLORREF(0x00_D0_D0_D0),
-                        COLORREF(0x00_B0_B0_B0),
-                        COLORREF(0x00_60_60_60),
-                        COLORREF(0x00_E8_E8_E8),
-                    ];
-                    for row in 0..2i32 {
-                        for col in 0..3i32 {
-                            let left = ox + col * (s + gap);
-                            let top = oy + row * (s + gap);
-                            let brush = CreateSolidBrush(shades[(row * 3 + col) as usize]);
-                            FillRect(hdc, &RECT {
-                                left,
-                                top,
-                                right: left + s,
-                                bottom: top + s,
-                            }, brush);
-                            DeleteObject(brush);
+                    let s = 5i32; // 每格邊長，無間隔
+                    let (cols, rows) = (4i32, 2i32);
+                    let ox = cx - cols * s / 2;
+                    let oy = cy - rows * s / 2;
+                    let b_dark  = CreateSolidBrush(COLORREF(0x00_50_50_50));
+                    let b_light = CreateSolidBrush(COLORREF(0x00_D0_D0_D0));
+                    for row in 0..rows {
+                        for col in 0..cols {
+                            let rc = RECT {
+                                left: ox + col * s, top: oy + row * s,
+                                right: ox + col * s + s, bottom: oy + row * s + s,
+                            };
+                            FillRect(hdc, &rc, if (row + col) % 2 == 0 { b_dark } else { b_light });
                         }
                     }
+                    DeleteObject(b_dark);
+                    DeleteObject(b_light);
                 }
                 BTN_COPY => {
                     let o = SelectObject(hdc, nb);
@@ -2020,15 +2017,64 @@ fn client_xy(lp: LPARAM) -> (i32, i32) {
     (x, y)
 }
 
-unsafe fn simple_input_dialog(parent: HWND) -> String {
+unsafe fn simple_input_dialog(
+    parent: HWND,
+    default_font: &str,
+    default_size: i32,
+) -> Option<(String, String, i32)> {
+    const DLG_W: i32 = 420;
+    const DLG_H: i32 = 154;
+
     let class = w!("srcshot_textinput");
     let hinstance = get_instance();
 
-    struct InputState { text: String, done: bool }
+    struct InputState {
+        text: String, font: String, size: i32,
+        done: bool, confirmed: bool,
+        bg_brush: isize, // HBRUSH for combobox CTLCOLOR
+    }
+
+    unsafe extern "system" fn enum_fonts_cb(
+        lplf: *const windows::Win32::Graphics::Gdi::LOGFONTW,
+        _: *const windows::Win32::Graphics::Gdi::TEXTMETRICW,
+        _: u32, lparam: LPARAM,
+    ) -> i32 {
+        let fonts = &mut *(lparam.0 as *mut Vec<String>);
+        let face = &(*lplf).lfFaceName;
+        let len = face.iter().position(|&c| c == 0).unwrap_or(32);
+        let name = String::from_utf16_lossy(&face[..len]);
+        if !name.starts_with('@') && !fonts.contains(&name) { fonts.push(name); }
+        1
+    }
+
+    unsafe fn read_values(hwnd: HWND, state: &mut InputState) {
+        if let Ok(e) = GetDlgItem(hwnd, 100) {
+            let n = GetWindowTextLengthW(e) + 1;
+            let mut b = vec![0u16; n as usize];
+            GetWindowTextW(e, &mut b);
+            state.text = String::from_utf16_lossy(&b).trim_end_matches('\0').to_string();
+        }
+        if let Ok(fc) = GetDlgItem(hwnd, 3) {
+            let n = GetWindowTextLengthW(fc) + 1;
+            let mut b = vec![0u16; n as usize];
+            GetWindowTextW(fc, &mut b);
+            let s = String::from_utf16_lossy(&b).trim_end_matches('\0').to_string();
+            if !s.is_empty() { state.font = s; }
+        }
+        if let Ok(sc) = GetDlgItem(hwnd, 4) {
+            let n = GetWindowTextLengthW(sc) + 1;
+            let mut b = vec![0u16; n as usize];
+            GetWindowTextW(sc, &mut b);
+            if let Ok(v) = String::from_utf16_lossy(&b).trim_end_matches('\0').parse::<i32>() {
+                state.size = v.clamp(1, 500);
+            }
+        }
+    }
 
     unsafe extern "system" fn input_wnd_proc(
         hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
     ) -> LRESULT {
+        const TH: i32 = 36;
         match msg {
             WM_NCCREATE => {
                 let cs = &*(lp.0 as *const CREATESTRUCTW);
@@ -2036,50 +2082,194 @@ unsafe fn simple_input_dialog(parent: HWND) -> String {
                 LRESULT(1)
             }
             WM_CREATE => {
-                let hinstance = get_instance();
-                let edit = CreateWindowExW(
-                    Default::default(), w!("EDIT"), w!(""),
-                    WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-                    8, 8, 260, 24, hwnd, HMENU(1usize as *mut _), hinstance, None,
-                ).unwrap();
-                CreateWindowExW(
-                    Default::default(), w!("BUTTON"), w!("確定"),
-                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
-                    8, 40, 80, 28, hwnd, HMENU(2usize as *mut _), hinstance, None,
-                ).unwrap();
-                // 送 WM_NEXTDLGCTL 讓 edit 自動成為焦點
-                PostMessageW(hwnd, WM_NEXTDLGCTL, WPARAM(edit.0 as usize), LPARAM(1)).ok();
+                let cs = &*(lp.0 as *const CREATESTRUCTW);
+                let init = &*(cs.lpCreateParams as *const InputState);
+                let hi = get_instance();
+                // 字型下拉（CBS_DROPDOWN=2, CBS_AUTOHSCROLL=0x40）
+                let fcb = CreateWindowExW(Default::default(), w!("COMBOBOX"), w!(""),
+                    WS_CHILD|WS_VISIBLE|WINDOW_STYLE(2|0x40|WS_VSCROLL.0),
+                    58, TH+8, 242, 240, hwnd, HMENU(3usize as *mut _), hi, None)
+                    .unwrap_or(HWND(std::ptr::null_mut()));
+                // 大小下拉（CBS_DROPDOWN=2）
+                let scb = CreateWindowExW(Default::default(), w!("COMBOBOX"), w!(""),
+                    WS_CHILD|WS_VISIBLE|WINDOW_STYLE(2|WS_VSCROLL.0),
+                    352, TH+8, 60, 200, hwnd, HMENU(4usize as *mut _), hi, None)
+                    .unwrap_or(HWND(std::ptr::null_mut()));
+                // 文字輸入框（ID=100, ES_AUTOHSCROLL=0x80）
+                let edit = CreateWindowExW(Default::default(), w!("EDIT"), w!(""),
+                    WS_CHILD|WS_VISIBLE|WS_BORDER|WINDOW_STYLE(0x0080),
+                    8, TH+46, 404, 26, hwnd, HMENU(100usize as *mut _), hi, None)
+                    .unwrap_or(HWND(std::ptr::null_mut()));
+                // 確定按鈕（ID=1, BS_OWNERDRAW=11）→ flat_dlg_drawbtn 以 CtlID==1 判斷主要按鈕（藍色）
+                CreateWindowExW(Default::default(), w!("BUTTON"), w!("確定"),
+                    WS_CHILD|WS_VISIBLE|WINDOW_STYLE(0x0000000Bu32),
+                    8, TH+82, 80, 28, hwnd, HMENU(1usize as *mut _), hi, None).ok();
+
+                // 列舉系統字型
+                if !fcb.0.is_null() {
+                    let sdc = GetDC(HWND(std::ptr::null_mut()));
+                    let mut fonts: Vec<String> = Vec::new();
+                    let lf = windows::Win32::Graphics::Gdi::LOGFONTW {
+                        lfCharSet: windows::Win32::Graphics::Gdi::FONT_CHARSET(1),
+                        ..Default::default()
+                    };
+                    windows::Win32::Graphics::Gdi::EnumFontFamiliesExW(
+                        sdc, &lf, Some(enum_fonts_cb),
+                        LPARAM(&mut fonts as *mut _ as isize), 0,
+                    );
+                    ReleaseDC(HWND(std::ptr::null_mut()), sdc);
+                    fonts.sort();
+                    for name in &fonts {
+                        let fw: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+                        SendMessageW(fcb, 0x0143, WPARAM(0), LPARAM(fw.as_ptr() as isize));
+                    }
+                    let dw: Vec<u16> = init.font.encode_utf16().chain(Some(0)).collect();
+                    let idx = SendMessageW(fcb, 0x0158, WPARAM(usize::MAX), LPARAM(dw.as_ptr() as isize));
+                    if idx.0 >= 0 {
+                        SendMessageW(fcb, 0x014E, WPARAM(idx.0 as usize), LPARAM(0));
+                    } else {
+                        SetWindowTextW(fcb, windows::core::PCWSTR(dw.as_ptr())).ok();
+                    }
+                }
+                if !scb.0.is_null() {
+                    for s in [8i32,10,12,14,16,18,20,24,28,32,36,48,72] {
+                        let sv: Vec<u16> = format!("{}\0",s).encode_utf16().collect();
+                        SendMessageW(scb, 0x0143, WPARAM(0), LPARAM(sv.as_ptr() as isize));
+                    }
+                    let sv: Vec<u16> = format!("{}\0", init.size).encode_utf16().collect();
+                    let idx = SendMessageW(scb, 0x0158, WPARAM(usize::MAX), LPARAM(sv.as_ptr() as isize));
+                    if idx.0 >= 0 {
+                        SendMessageW(scb, 0x014E, WPARAM(idx.0 as usize), LPARAM(0));
+                    } else {
+                        SetWindowTextW(scb, windows::core::PCWSTR(sv.as_ptr())).ok();
+                    }
+                }
+                if !edit.0.is_null() { SetFocus(edit); }
+                // 建立主題背景刷，供 CTLCOLOR 回傳
+                let b = CreateSolidBrush(COLORREF(crate::theme::colors().toolbar_bg));
+                let state_mut = &mut *(cs.lpCreateParams as *mut InputState);
+                state_mut.bg_brush = b.0 as isize;
                 LRESULT(0)
             }
-            WM_COMMAND if (wp.0 & 0xFFFF) == 2 => {
-                // 確定按鈕：讀取文字後同步銷毀視窗（不 PostMessage WM_CLOSE）
-                let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut InputState);
-                if let Ok(edit) = GetDlgItem(hwnd, 1) {
-                    let len = GetWindowTextLengthW(edit) + 1;
-                    let mut buf = vec![0u16; len as usize];
-                    GetWindowTextW(edit, &mut buf);
-                    state.text = String::from_utf16_lossy(&buf)
-                        .trim_end_matches('\0').to_string();
+            WM_ERASEBKGND => LRESULT(1),
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                let mut rc = RECT::default();
+                GetClientRect(hwnd, &mut rc).ok();
+                let (w, h) = (rc.right, rc.bottom);
+                let tc = crate::theme::colors();
+
+                // 背景
+                let bg = CreateSolidBrush(COLORREF(tc.toolbar_bg));
+                FillRect(hdc, &RECT { left:0, top:0, right:w, bottom:h }, bg);
+                DeleteObject(bg);
+
+                // 外框 + 標題列下邊線
+                let dark = crate::theme::current() == crate::theme::Theme::Dark;
+                let border_c = if dark { 0x00_55_55_55u32 } else { 0x00_C0_C0_C0u32 };
+                let pen = CreatePen(PS_SOLID, 1, COLORREF(border_c));
+                let op = SelectObject(hdc, pen);
+                MoveToEx(hdc, 0, 0, None); LineTo(hdc, w-1, 0);
+                LineTo(hdc, w-1, h-1); LineTo(hdc, 0, h-1); LineTo(hdc, 0, 0);
+                MoveToEx(hdc, 0, TH, None); LineTo(hdc, w, TH);
+                SelectObject(hdc, op); DeleteObject(pen);
+
+                SetBkMode(hdc, BACKGROUND_MODE(1));
+                let of = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+
+                // 標題文字
+                SetTextColor(hdc, COLORREF(tc.tab_text_active));
+                let mut title: Vec<u16> = crate::i18n::t("輸入文字","Enter Text").encode_utf16().collect();
+                let mut trc = RECT { left:10, top:0, right:w-30, bottom:TH };
+                DrawTextW(hdc, &mut title, &mut trc, DRAW_TEXT_FORMAT(0x24)); // DT_SINGLELINE|DT_VCENTER
+
+                // × 關閉符號（右上角）
+                let close_c = if dark { 0x00_AA_AA_AA } else { 0x00_60_60_60 };
+                SetTextColor(hdc, COLORREF(close_c));
+                let mut xw = [0x00D7u16];
+                let mut xrc = RECT { left:w-28, top:0, right:w-2, bottom:TH };
+                DrawTextW(hdc, &mut xw, &mut xrc, DRAW_TEXT_FORMAT(0x25)); // DT_SINGLELINE|DT_VCENTER|DT_CENTER
+
+                // 下拉清單標籤（在 WM_PAINT 繪製，不用 STATIC 控制項避免截字）
+                SetTextColor(hdc, COLORREF(tc.tab_text_active));
+                let mut fl: Vec<u16> = crate::i18n::t("字型：","Font:").encode_utf16().collect();
+                let mut flrc = RECT { left:8, top:TH+8, right:58, bottom:TH+34 };
+                DrawTextW(hdc, &mut fl, &mut flrc, DRAW_TEXT_FORMAT(0x24));
+                let mut sl: Vec<u16> = crate::i18n::t("大小：","Size:").encode_utf16().collect();
+                let mut slrc = RECT { left:308, top:TH+8, right:352, bottom:TH+34 };
+                DrawTextW(hdc, &mut sl, &mut slrc, DRAW_TEXT_FORMAT(0x24));
+
+                SelectObject(hdc, of);
+                EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            WM_DRAWITEM => { flat_dlg_drawbtn(lp); LRESULT(1) }
+            // 下拉清單與 Edit 子控制項：套用主題色 (WM_CTLCOLOREDIT=0x133, WM_CTLCOLORLISTBOX=0x14B)
+            0x0133 | 0x014B => {
+                let s = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const InputState);
+                if s.bg_brush != 0 {
+                    let hdc = windows::Win32::Graphics::Gdi::HDC(wp.0 as *mut _);
+                    SetTextColor(hdc, COLORREF(crate::theme::colors().tab_text_active));
+                    SetBkMode(hdc, BACKGROUND_MODE(1));
+                    return LRESULT(s.bg_brush);
                 }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_NCHITTEST => {
+                // 標題列可拖動（排除右側 × 區域）
+                let sy = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+                let sx = (lp.0 & 0xFFFF) as i16 as i32;
+                let mut wr = RECT::default();
+                GetWindowRect(hwnd, &mut wr).ok();
+                let cy = sy - wr.top;
+                let cx = sx - wr.left;
+                if cy >= 0 && cy < TH && cx < wr.right - wr.left - 28 {
+                    return LRESULT(2); // HTCAPTION
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_LBUTTONDOWN => {
+                let cx = (lp.0 & 0xFFFF) as i16 as i32;
+                let cy = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+                let mut rc = RECT::default();
+                GetClientRect(hwnd, &mut rc).ok();
+                if cy < TH && cx >= rc.right - 28 {
+                    let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut InputState);
+                    state.done = true;
+                    DestroyWindow(hwnd).ok();
+                }
+                LRESULT(0)
+            }
+            WM_COMMAND if (wp.0 & 0xFFFF) == 1 && (wp.0 >> 16) as u16 == 0 => {
+                let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut InputState);
+                read_values(hwnd, state);
+                state.confirmed = true;
                 state.done = true;
-                DestroyWindow(hwnd).ok(); // 同步銷毀，WM_DESTROY 不再 PostQuitMessage
+                DestroyWindow(hwnd).ok();
                 LRESULT(0)
             }
             WM_CLOSE => {
-                // 使用者按 X 或 Escape（IsDialogMessageW 轉送）：直接銷毀
                 let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut InputState);
                 state.done = true;
                 DestroyWindow(hwnd).ok();
                 LRESULT(0)
             }
-            // WM_DESTROY：絕對不能呼叫 PostQuitMessage，否則會殺死編輯器迴圈
-            WM_DESTROY => LRESULT(0),
+            WM_DESTROY => {
+                // 清理主題刷
+                let s = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const InputState);
+                if s.bg_brush != 0 {
+                    DeleteObject(windows::Win32::Graphics::Gdi::HBRUSH(s.bg_brush as *mut _));
+                }
+                LRESULT(0)
+            }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }
 
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        style: CS_DROPSHADOW,
         lpfnWndProc: Some(input_wnd_proc),
         hInstance: hinstance,
         lpszClassName: class,
@@ -2087,37 +2277,47 @@ unsafe fn simple_input_dialog(parent: HWND) -> String {
     };
     let _ = RegisterClassExW(&wc);
 
-    let mut state = InputState { text: String::new(), done: false };
+    let mut state = InputState {
+        text: String::new(), font: default_font.to_string(), size: default_size,
+        done: false, confirmed: false, bg_brush: 0,
+    };
+
+    let mut pr = RECT::default();
+    GetWindowRect(parent, &mut pr).ok();
+    let px = (pr.left + pr.right) / 2 - DLG_W / 2;
+    let py = (pr.top + pr.bottom) / 2 - DLG_H / 2;
+
     let dlg = CreateWindowExW(
-        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-        class,
-        w!("輸入文字"),
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 290, 110,
-        parent,
-        HMENU(std::ptr::null_mut()),
-        hinstance,
+        WS_EX_TOPMOST,
+        class, w!(""),
+        WS_POPUP | WS_VISIBLE,
+        px, py, DLG_W, DLG_H,
+        parent, HMENU(std::ptr::null_mut()), hinstance,
         Some(&mut state as *mut _ as _),
-    )
-    .unwrap();
+    ).unwrap();
+
+    SetForegroundWindow(dlg).ok();
+    if let Ok(edit) = GetDlgItem(dlg, 100) { SetFocus(edit); }
 
     let mut msg = MSG::default();
     while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
-        // Enter 直接確定（CreateWindowEx 建立的非 dialog 視窗，
-        // IsDialogMessageW 可能無法正確觸發預設按鈕，所以手動攔截）
-        if msg.message == WM_KEYDOWN && msg.wParam.0 == VK_RETURN.0 as usize {
-            if let Ok(edit) = GetDlgItem(dlg, 1) {
-                let len = GetWindowTextLengthW(edit) + 1;
-                let mut buf = vec![0u16; len as usize];
-                GetWindowTextW(edit, &mut buf);
-                state.text = String::from_utf16_lossy(&buf)
-                    .trim_end_matches('\0').to_string();
+        if msg.message == WM_KEYDOWN {
+            match msg.wParam.0 {
+                k if k == VK_RETURN.0 as usize && GetDlgCtrlID(msg.hwnd) == 100 => {
+                    read_values(dlg, &mut state);
+                    state.confirmed = true;
+                    state.done = true;
+                    DestroyWindow(dlg).ok();
+                    break;
+                }
+                k if k == VK_ESCAPE.0 as usize => {
+                    state.done = true;
+                    DestroyWindow(dlg).ok();
+                    break;
+                }
+                _ => {}
             }
-            state.done = true;
-            DestroyWindow(dlg).ok();
-            break;
         }
-        // IsDialogMessageW 處理 Escape（取消）、Tab（切焦點）
         if IsDialogMessageW(dlg, &msg).as_bool() {
             if state.done { break; }
             continue;
@@ -2128,7 +2328,11 @@ unsafe fn simple_input_dialog(parent: HWND) -> String {
     }
 
     let _ = UnregisterClassW(class, hinstance);
-    state.text
+    if state.confirmed && !state.text.is_empty() {
+        Some((state.text, state.font, state.size))
+    } else {
+        None
+    }
 }
 
 /// 顯示系統另存新檔對話框，回傳使用者選擇的路徑；取消則回傳 None
@@ -2707,62 +2911,172 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
             crate::config::persist_settings(&c);
         }
         CM_DELAY_CUSTOM => {
-            // 重用自訂延遲輸入框
             let current = state.config.lock().unwrap().capture_delay_secs;
-            // 用 custom_color_input_dialog 的樣板建立數字輸入
             let config_arc = state.config.clone();
             let class = w!("srcshot_delaydlg2");
             let hinstance = get_instance();
             struct DS { value: u32, confirmed: bool, done: bool }
             unsafe extern "system" fn dp(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+                const TH: i32 = 36;
                 match msg {
-                    WM_NCCREATE => { let cs = &*(lp.0 as *const CREATESTRUCTW); SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as _); LRESULT(1) }
+                    WM_NCCREATE => {
+                        let cs = &*(lp.0 as *const CREATESTRUCTW);
+                        SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as _);
+                        LRESULT(1)
+                    }
                     WM_CREATE => {
-                        let hi = {
-                            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-                            windows::Win32::Foundation::HINSTANCE::from(GetModuleHandleW(None).unwrap())
-                        };
-                        CreateWindowExW(Default::default(), w!("STATIC"), w!("延遲秒數（0–99）："), WS_CHILD|WS_VISIBLE, 8,10,200,18, hwnd, HMENU(std::ptr::null_mut()), hi, None).ok();
-                        let edit = CreateWindowExW(WS_EX_CLIENTEDGE, w!("EDIT"), w!(""), WS_CHILD|WS_VISIBLE|WINDOW_STYLE(0x2000u32), 8,32,80,24, hwnd, HMENU(1usize as _), hi, None).unwrap();
-                        CreateWindowExW(Default::default(), w!("BUTTON"), w!("確定"), WS_CHILD|WS_VISIBLE|WINDOW_STYLE(BS_DEFPUSHBUTTON as u32), 8,64,80,28, hwnd, HMENU(2usize as _), hi, None).ok();
-                        CreateWindowExW(Default::default(), w!("BUTTON"), w!("取消"), WS_CHILD|WS_VISIBLE, 96,64,80,28, hwnd, HMENU(3usize as _), hi, None).ok();
-                        let s = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const DS);
-                        let pre: Vec<u16> = format!("{}\0", s.value).encode_utf16().collect();
-                        SetWindowTextW(edit, windows::core::PCWSTR(pre.as_ptr())).ok();
-                        PostMessageW(hwnd, WM_NEXTDLGCTL, WPARAM(edit.0 as usize), LPARAM(1)).ok();
+                        let hi = get_instance();
+                        let cs = &*(lp.0 as *const CREATESTRUCTW);
+                        let ds = &*(cs.lpCreateParams as *const DS);
+                        // 數字輸入框（ID=100, ES_NUMBER=0x2000）
+                        let edit = CreateWindowExW(Default::default(), w!("EDIT"), w!(""),
+                            WS_CHILD|WS_VISIBLE|WS_BORDER|WINDOW_STYLE(0x2000u32),
+                            8, TH+34, 80, 26, hwnd, HMENU(100usize as _), hi, None)
+                            .unwrap_or(HWND(std::ptr::null_mut()));
+                        // 確定（ID=1, BS_OWNERDRAW → 主要藍色按鈕）
+                        CreateWindowExW(Default::default(), w!("BUTTON"), w!("確定"),
+                            WS_CHILD|WS_VISIBLE|WINDOW_STYLE(0x0000000Bu32),
+                            8, TH+70, 80, 28, hwnd, HMENU(1usize as _), hi, None).ok();
+                        // 取消（ID=2, BS_OWNERDRAW）
+                        CreateWindowExW(Default::default(), w!("BUTTON"), w!("取消"),
+                            WS_CHILD|WS_VISIBLE|WINDOW_STYLE(0x0000000Bu32),
+                            100, TH+70, 80, 28, hwnd, HMENU(2usize as _), hi, None).ok();
+                        if !edit.0.is_null() {
+                            let pre: Vec<u16> = format!("{}\0", ds.value).encode_utf16().collect();
+                            SetWindowTextW(edit, windows::core::PCWSTR(pre.as_ptr())).ok();
+                            SetFocus(edit);
+                        }
+                        LRESULT(0)
+                    }
+                    WM_ERASEBKGND => LRESULT(1),
+                    WM_PAINT => {
+                        let mut ps = PAINTSTRUCT::default();
+                        let hdc = BeginPaint(hwnd, &mut ps);
+                        let mut rc = RECT::default();
+                        GetClientRect(hwnd, &mut rc).ok();
+                        let (w, h) = (rc.right, rc.bottom);
+                        let tc = crate::theme::colors();
+                        let bg = CreateSolidBrush(COLORREF(tc.toolbar_bg));
+                        FillRect(hdc, &RECT{left:0,top:0,right:w,bottom:h}, bg);
+                        DeleteObject(bg);
+                        let dark = crate::theme::current() == crate::theme::Theme::Dark;
+                        let border_c = if dark { 0x00_55_55_55u32 } else { 0x00_C0_C0_C0u32 };
+                        let pen = CreatePen(PS_SOLID, 1, COLORREF(border_c));
+                        let op = SelectObject(hdc, pen);
+                        MoveToEx(hdc, 0, 0, None); LineTo(hdc, w-1, 0);
+                        LineTo(hdc, w-1, h-1); LineTo(hdc, 0, h-1); LineTo(hdc, 0, 0);
+                        MoveToEx(hdc, 0, TH, None); LineTo(hdc, w, TH);
+                        SelectObject(hdc, op); DeleteObject(pen);
+                        SetBkMode(hdc, BACKGROUND_MODE(1));
+                        let of = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+                        SetTextColor(hdc, COLORREF(tc.tab_text_active));
+                        let mut title: Vec<u16> = crate::i18n::t("自訂延遲","Custom Delay").encode_utf16().collect();
+                        let mut trc = RECT{left:10,top:0,right:w-30,bottom:TH};
+                        DrawTextW(hdc, &mut title, &mut trc, DRAW_TEXT_FORMAT(0x24));
+                        let close_c = if dark { 0x00_AA_AA_AA } else { 0x00_60_60_60 };
+                        SetTextColor(hdc, COLORREF(close_c));
+                        let mut xw = [0x00D7u16];
+                        let mut xrc = RECT{left:w-28,top:0,right:w-2,bottom:TH};
+                        DrawTextW(hdc, &mut xw, &mut xrc, DRAW_TEXT_FORMAT(0x25));
+                        SetTextColor(hdc, COLORREF(tc.tab_text_active));
+                        let mut lbl: Vec<u16> = crate::i18n::t("延遲秒數（0–99）：","Delay seconds (0–99):").encode_utf16().collect();
+                        let mut lrc = RECT{left:8, top:TH+8, right:w-8, bottom:TH+30};
+                        DrawTextW(hdc, &mut lbl, &mut lrc, DRAW_TEXT_FORMAT(0x24));
+                        SelectObject(hdc, of);
+                        EndPaint(hwnd, &ps);
+                        LRESULT(0)
+                    }
+                    WM_DRAWITEM => { flat_dlg_drawbtn(lp); LRESULT(1) }
+                    WM_NCHITTEST => {
+                        let sy = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+                        let sx = (lp.0 & 0xFFFF) as i16 as i32;
+                        let mut wr = RECT::default(); GetWindowRect(hwnd, &mut wr).ok();
+                        let cy = sy - wr.top; let cx = sx - wr.left;
+                        if cy >= 0 && cy < TH && cx < wr.right - wr.left - 28 {
+                            return LRESULT(2);
+                        }
+                        DefWindowProcW(hwnd, msg, wp, lp)
+                    }
+                    WM_LBUTTONDOWN => {
+                        let cx = (lp.0 & 0xFFFF) as i16 as i32;
+                        let cy = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+                        let mut rc = RECT::default(); GetClientRect(hwnd, &mut rc).ok();
+                        if cy < TH && cx >= rc.right - 28 {
+                            let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS);
+                            s.done = true; DestroyWindow(hwnd).ok();
+                        }
+                        LRESULT(0)
+                    }
+                    WM_COMMAND if (wp.0 & 0xFFFF) == 1 && (wp.0 >> 16) as u16 == 0 => {
+                        let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS);
+                        if let Ok(edit) = GetDlgItem(hwnd, 100) {
+                            let n = GetWindowTextLengthW(edit) + 1;
+                            let mut buf = vec![0u16; n as usize];
+                            GetWindowTextW(edit, &mut buf);
+                            s.value = String::from_utf16_lossy(&buf).trim_end_matches('\0')
+                                .parse::<u32>().unwrap_or(0).min(99);
+                        }
+                        s.confirmed = true; s.done = true; DestroyWindow(hwnd).ok();
                         LRESULT(0)
                     }
                     WM_COMMAND if (wp.0 & 0xFFFF) == 2 => {
                         let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS);
-                        if let Ok(edit) = GetDlgItem(hwnd, 1) {
-                            let n = GetWindowTextLengthW(edit) + 1;
-                            let mut buf = vec![0u16; n as usize];
-                            GetWindowTextW(edit, &mut buf);
-                            s.value = String::from_utf16_lossy(&buf).trim_end_matches('\0').parse::<u32>().unwrap_or(0).min(99);
-                        }
-                        s.confirmed = true; s.done = true; DestroyWindow(hwnd).ok(); LRESULT(0)
+                        s.done = true; DestroyWindow(hwnd).ok();
+                        LRESULT(0)
                     }
-                    WM_COMMAND if (wp.0 & 0xFFFF) == 3 => { let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS); s.done = true; DestroyWindow(hwnd).ok(); LRESULT(0) }
-                    WM_CLOSE => { let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS); s.done = true; DestroyWindow(hwnd).ok(); LRESULT(0) }
+                    WM_CLOSE => {
+                        let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS);
+                        s.done = true; DestroyWindow(hwnd).ok();
+                        LRESULT(0)
+                    }
                     WM_DESTROY => LRESULT(0),
                     _ => DefWindowProcW(hwnd, msg, wp, lp),
                 }
             }
-            let wc = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, lpfnWndProc: Some(dp), hInstance: hinstance, lpszClassName: class, ..Default::default() };
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: CS_DROPSHADOW,
+                lpfnWndProc: Some(dp),
+                hInstance: hinstance,
+                lpszClassName: class,
+                ..Default::default()
+            };
             let _ = RegisterClassExW(&wc);
             let mut ds = DS { value: current, confirmed: false, done: false };
-            let dlg = CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_TOPMOST, class, w!("自訂延遲秒數"), WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 200, 140, hwnd, HMENU(std::ptr::null_mut()), hinstance, Some(&mut ds as *mut _ as _)).unwrap_or(HWND(std::ptr::null_mut()));
+            let mut pr = RECT::default();
+            GetWindowRect(hwnd, &mut pr).ok();
+            let (dlg_w, dlg_h) = (220i32, 140i32);
+            let px = (pr.left + pr.right) / 2 - dlg_w / 2;
+            let py = (pr.top + pr.bottom) / 2 - dlg_h / 2;
+            let dlg = CreateWindowExW(
+                WS_EX_TOPMOST, class, w!(""),
+                WS_POPUP | WS_VISIBLE,
+                px, py, dlg_w, dlg_h,
+                hwnd, HMENU(std::ptr::null_mut()), hinstance,
+                Some(&mut ds as *mut _ as _),
+            ).unwrap_or(HWND(std::ptr::null_mut()));
             if !dlg.0.is_null() {
+                SetForegroundWindow(dlg).ok();
+                if let Ok(edit) = GetDlgItem(dlg, 100) { SetFocus(edit); }
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
-                    if msg.message == WM_KEYDOWN && msg.wParam.0 == VK_RETURN.0 as usize {
-                        if let Ok(edit) = GetDlgItem(dlg, 1) {
-                            let n = GetWindowTextLengthW(edit) + 1;
-                            let mut buf = vec![0u16; n as usize];
-                            GetWindowTextW(edit, &mut buf);
-                            ds.value = String::from_utf16_lossy(&buf).trim_end_matches('\0').parse::<u32>().unwrap_or(0).min(99);
+                    if msg.message == WM_KEYDOWN {
+                        match msg.wParam.0 {
+                            k if k == VK_RETURN.0 as usize && GetDlgCtrlID(msg.hwnd) == 100 => {
+                                if let Ok(edit) = GetDlgItem(dlg, 100) {
+                                    let n = GetWindowTextLengthW(edit) + 1;
+                                    let mut buf = vec![0u16; n as usize];
+                                    GetWindowTextW(edit, &mut buf);
+                                    ds.value = String::from_utf16_lossy(&buf).trim_end_matches('\0')
+                                        .parse::<u32>().unwrap_or(0).min(99);
+                                }
+                                ds.confirmed = true; ds.done = true; DestroyWindow(dlg).ok(); break;
+                            }
+                            k if k == VK_ESCAPE.0 as usize => {
+                                ds.done = true; DestroyWindow(dlg).ok(); break;
+                            }
+                            _ => {}
                         }
-                        ds.confirmed = true; ds.done = true; DestroyWindow(dlg).ok(); break;
                     }
                     if IsDialogMessageW(dlg, &msg).as_bool() { if ds.done { break; } continue; }
                     let _ = TranslateMessage(&msg); DispatchMessageW(&msg);

@@ -1,6 +1,6 @@
 use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, LineTo, MoveToEx,
+    CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, LineTo, MoveToEx,
     Rectangle, SelectObject, TextOutW, HDC, PS_SOLID,
 };
 
@@ -18,7 +18,7 @@ pub enum Stroke {
     Pen { points: Vec<POINT> },
     Arrow { from: POINT, to: POINT },
     Rect { r: windows::Win32::Foundation::RECT },
-    Text { pos: POINT, text: String },
+    Text { pos: POINT, text: String, font: String, size: i32 },
 }
 
 #[derive(Clone, Copy)]
@@ -69,17 +69,21 @@ impl Stroke {
                     SelectObject(hdc, null_brush);
                     Rectangle(hdc, r.left, r.top, r.right, r.bottom);
                 }
-                Stroke::Text { pos, text } => {
+                Stroke::Text { pos, text, font, size } => {
+                    let font_wide: Vec<u16> = font.encode_utf16().chain(Some(0)).collect();
+                    let hfont = CreateFontW(
+                        -*size, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0,
+                        windows::core::PCWSTR(font_wide.as_ptr()),
+                    );
+                    let old_font = SelectObject(hdc, hfont);
                     windows::Win32::Graphics::Gdi::SetTextColor(
-                        hdc,
-                        windows::Win32::Foundation::COLORREF(color.0),
-                    );
+                        hdc, windows::Win32::Foundation::COLORREF(color.0));
                     windows::Win32::Graphics::Gdi::SetBkMode(
-                        hdc,
-                        windows::Win32::Graphics::Gdi::TRANSPARENT,
-                    );
+                        hdc, windows::Win32::Graphics::Gdi::TRANSPARENT);
                     let wide: Vec<u16> = text.encode_utf16().collect();
                     TextOutW(hdc, pos.x, pos.y, &wide);
+                    SelectObject(hdc, old_font);
+                    DeleteObject(hfont);
                 }
             }
 
