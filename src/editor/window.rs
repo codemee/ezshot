@@ -1441,10 +1441,23 @@ unsafe extern "system" fn editor_wnd_proc(
 
             match id {
                 BTN_PEN => {
-                    let _ = Polyline(hdc, &[POINT{x:cx-5,y:cy-5}, POINT{x:cx+3,y:cy+3}]);
+                    // 鉛筆輪廓：橡皮擦在左上，尖端朝右下；2px 線條，不填滿
+                    let thick_pen = CreatePen(PS_SOLID, 2, text_color);
+                    let ot = SelectObject(hdc, thick_pen);
+                    let on = SelectObject(hdc, nb);
                     let _ = Polygon(hdc, &[
-                        POINT{x:cx+3,y:cy+3}, POINT{x:cx+6,y:cy+1}, POINT{x:cx+1,y:cy+6},
+                        POINT{x:cx-4, y:cy-6},  // 橡皮擦上角
+                        POINT{x:cx+3, y:cy+1},  // 筆身/尖端上接點
+                        POINT{x:cx+6, y:cy+6},  // 筆尖頂點
+                        POINT{x:cx+1, y:cy+3},  // 筆身/尖端下接點
+                        POINT{x:cx-6, y:cy-4},  // 橡皮擦下角
                     ]);
+                    // 橡皮擦分界線（垂直於筆桿軸）
+                    let _ = MoveToEx(hdc, cx-5, cy-3, None);
+                    let _ = LineTo(hdc, cx-3, cy-5);
+                    SelectObject(hdc, ot);
+                    SelectObject(hdc, on);
+                    DeleteObject(thick_pen);
                 }
                 BTN_ARROW => {
                     let _ = Polyline(hdc, &[POINT{x:cx-7,y:cy}, POINT{x:cx+2,y:cy}]);
@@ -1470,21 +1483,11 @@ unsafe extern "system" fn editor_wnd_proc(
                             state.tabs[state.active_tab].canvas.tool_thickness,
                         )
                     };
-                    // ▼ 小箭頭在左側，垂直置中
-                    let ax = rc.left + 7;
-                    let ap = CreatePen(PS_SOLID, 1, COLORREF(0x00_40_40_40));
-                    let ab = CreateSolidBrush(COLORREF(0x00_40_40_40));
-                    let top = SelectObject(hdc, ap); let tob = SelectObject(hdc, ab);
-                    let _ = Polygon(hdc, &[
-                        POINT{x:ax-4,y:cy-2}, POINT{x:ax+4,y:cy-2}, POINT{x:ax,y:cy+2},
-                    ]);
-                    SelectObject(hdc, top); SelectObject(hdc, tob);
-                    DeleteObject(ap); DeleteObject(ab);
-                    // 橫線在右側，平頭端點（FillRect 無圓弧溢出），垂直置中
+                    // 橫線置中顯示目前線條色彩與粗細
                     let t = tool_thick.min(14).max(1);
                     let line_top = cy - t / 2;
-                    let line_rc = RECT { left: rc.left + 17, top: line_top,
-                        right: rc.right - 4, bottom: line_top + t };
+                    let line_rc = RECT { left: rc.left + 7, top: line_top,
+                        right: rc.right - 7, bottom: line_top + t };
                     let lb = CreateSolidBrush(COLORREF(tool_color));
                     FillRect(hdc, &line_rc, lb);
                     DeleteObject(lb);
@@ -1630,6 +1633,20 @@ unsafe extern "system" fn editor_wnd_proc(
                     }
                 }
             }
+            LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            let mmi = &mut *(lp.0 as *mut windows::Win32::UI::WindowsAndMessaging::MINMAXINFO);
+            // 最小客戶區寬度：13 個工具列按鈕全部可見
+            let min_cw = BTN_MARGIN + 13 * (BTN_W + BTN_MARGIN) + 20;
+            let min_ch = CANVAS_Y + 120;
+            // 用 AdjustWindowRectEx 換算為含非客戶區（標題列＋邊框）的視窗大小
+            let mut r = windows::Win32::Foundation::RECT { left: 0, top: 0, right: min_cw, bottom: min_ch };
+            let _ = windows::Win32::UI::WindowsAndMessaging::AdjustWindowRectEx(
+                &mut r, WS_OVERLAPPEDWINDOW, windows::Win32::Foundation::BOOL(0), WS_EX_APPWINDOW,
+            );
+            mmi.ptMinTrackSize.x = r.right - r.left;
+            mmi.ptMinTrackSize.y = r.bottom - r.top;
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
@@ -2195,7 +2212,7 @@ unsafe fn simple_input_dialog(
     default_size: i32,
 ) -> Option<(String, String, i32)> {
     const DLG_W: i32 = 420;
-    const DLG_H: i32 = 154;
+    const DLG_H: i32 = 146;
 
     let class = w!("srcshot_textinput");
     let hinstance = get_instance();
@@ -2280,13 +2297,13 @@ unsafe fn simple_input_dialog(
                 }
                 // 文字輸入框（ID=100, ES_AUTOHSCROLL=0x80）
                 let edit = CreateWindowExW(Default::default(), w!("EDIT"), w!(""),
-                    WS_CHILD|WS_VISIBLE|WS_BORDER|WINDOW_STYLE(0x0080),
-                    8, TH+46, 404, 26, hwnd, HMENU(100usize as *mut _), hi, None)
+                    WS_CHILD|WS_VISIBLE|WINDOW_STYLE(0x0080),
+                    8, TH+46, 404, 18, hwnd, HMENU(100usize as *mut _), hi, None)
                     .unwrap_or(HWND(std::ptr::null_mut()));
                 // 確定按鈕（ID=1, BS_OWNERDRAW=11）→ flat_dlg_drawbtn 以 CtlID==1 判斷主要按鈕（藍色）
                 CreateWindowExW(Default::default(), w!("BUTTON"), w!("確定"),
                     WS_CHILD|WS_VISIBLE|WINDOW_STYLE(0x0000000Bu32),
-                    8, TH+82, 80, 28, hwnd, HMENU(1usize as *mut _), hi, None).ok();
+                    8, TH+74, 80, 28, hwnd, HMENU(1usize as *mut _), hi, None).ok();
 
                 // 列舉系統字型
                 if !fcb.0.is_null() {
@@ -2374,6 +2391,13 @@ unsafe fn simple_input_dialog(
                 let mut xrc = RECT { left:w-28, top:0, right:w-2, bottom:TH };
                 DrawTextW(hdc, &mut xw, &mut xrc, DRAW_TEXT_FORMAT(0x25)); // DT_SINGLELINE|DT_VCENTER|DT_CENTER
 
+                // 文字輸入框淡色外框
+                let input_c = if dark { 0x00_77_77_77u32 } else { 0x00_A0_A0_A0u32 };
+                let ep = CreatePen(PS_SOLID, 1, COLORREF(input_c));
+                let ope = SelectObject(hdc, ep);
+                MoveToEx(hdc, 7, TH+45, None);
+                LineTo(hdc, 412, TH+45); LineTo(hdc, 412, TH+64); LineTo(hdc, 7, TH+64); LineTo(hdc, 7, TH+45);
+                SelectObject(hdc, ope); DeleteObject(ep);
                 // 下拉清單標籤（在 WM_PAINT 繪製，不用 STATIC 控制項避免截字）
                 SetTextColor(hdc, COLORREF(tc.tab_text_active));
                 let mut fl: Vec<u16> = crate::i18n::t("字型：","Font:").encode_utf16().collect();
@@ -2566,13 +2590,14 @@ unsafe fn simple_color_dialog(owner: HWND, cur_color: u32, cur_thickness: i32) -
         0x00_00_00_FF, 0x00_00_80_FF, 0x00_00_FF_FF, 0x00_00_C8_00,
         0x00_FF_FF_00, 0x00_FF_00_00, 0x00_80_00_80, 0x00_FF_00_FF,
     ];
-    const SW: i32 = 28; const SG: i32 = 2;
-    const PAD: i32 = 4; const COLS: i32 = 6; const ROWS: i32 = 2;
-    const CCV: i32 = 22; const SEP: i32 = 8; const TH: i32 = 30;
+    const SW: i32 = 18; const SG: i32 = 4;
+    const PAD: i32 = 8; const COLS: i32 = 6; const ROWS: i32 = 2;
+    const CCV: i32 = 22; const SEP: i32 = 8; const TH: i32 = 22;
+    const SWATCH_GAP: i32 = 8; // 色塊區與「自訂顏色…」之間的額外間距
 
     let win_w      = 2 * PAD + COLS * SW + (COLS - 1) * SG;
     let swatches_h = ROWS * SW + (ROWS - 1) * SG;
-    let cc_y       = PAD + swatches_h;
+    let cc_y       = PAD + swatches_h + SWATCH_GAP;
     let thick_y    = cc_y + CCV + SEP;
     let win_h      = thick_y + TH + PAD;
 
@@ -2586,16 +2611,17 @@ unsafe fn simple_color_dialog(owner: HWND, cur_color: u32, cur_thickness: i32) -
         cc_y: i32, thick_y: i32,
         cur_color_idx: i32,
         preview_thick: i32,
-        preview_color: u32,         // 橫線預覽顏色（初始化為目前 tool_color）
+        preview_color: u32,
         edit_hwnd: isize,
-        initial_btn_released: bool, // 等待開啟時的滑鼠鍵放開，再啟動外部點擊偵測
+        initial_btn_released: bool,
+        bg_brush: isize,
     }
 
     unsafe extern "system" fn drop_proc(
         hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
     ) -> LRESULT {
-        const SW3: i32 = 28; const SG3: i32 = 2; const PAD3: i32 = 4; const COLS3: i32 = 6;
-        const TH3: i32 = 30; const EW3: i32 = 44; const CCV3: i32 = 22;
+        const SW3: i32 = 18; const SG3: i32 = 4; const PAD3: i32 = 8; const COLS3: i32 = 6;
+        const TH3: i32 = 22; const EW3: i32 = 44; const CCV3: i32 = 22;
         const ID_EDIT3: i32 = 100; const TIMER_OUTSIDE3: usize = 88;
         const PALETTE3: [u32; 12] = [
             0x00_00_00_00, 0x00_40_40_40, 0x00_80_80_80, 0x00_FF_FF_FF,
@@ -2610,10 +2636,12 @@ unsafe fn simple_color_dialog(owner: HWND, cur_color: u32, cur_thickness: i32) -
             }
             WM_CREATE => {
                 let st = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut CState);
+                let b = CreateSolidBrush(COLORREF(crate::theme::colors().toolbar_bg));
+                st.bg_brush = b.0 as isize;
                 // 建立真正的 EDIT 子控制項（有游標、原生鍵盤處理）
                 let edit_y = st.thick_y + 2; let edit_h = TH3 - 4;
                 let edit = CreateWindowExW(
-                    WS_EX_CLIENTEDGE, w!("EDIT"), w!(""),
+                    WINDOW_EX_STYLE(0), w!("EDIT"), w!(""),
                     WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x2000 | 0x0080), // ES_NUMBER|ES_AUTOHSCROLL
                     PAD3, edit_y, EW3, edit_h,
                     hwnd, HMENU(ID_EDIT3 as usize as _), get_instance(), None,
@@ -2634,37 +2662,64 @@ unsafe fn simple_color_dialog(owner: HWND, cur_color: u32, cur_thickness: i32) -
                 let hdc = BeginPaint(hwnd, &mut ps);
                 let mut rc = RECT::default();
                 GetClientRect(hwnd, &mut rc);
+                let (w, h) = (rc.right, rc.bottom);
+                let tc = crate::theme::colors();
+                let dark = crate::theme::current() == crate::theme::Theme::Dark;
+                let border_c = if dark { 0x00_55_55_55u32 } else { 0x00_C0_C0_C0u32 };
                 // 背景
-                let bg = CreateSolidBrush(COLORREF(0x00_F5_F5_F5));
+                let bg = CreateSolidBrush(COLORREF(tc.toolbar_bg));
                 FillRect(hdc, &rc, bg); DeleteObject(bg);
-                // 色塊
+                // 外框（1px，與扁平對話框一致）
+                let frame = CreatePen(PS_SOLID, 1, COLORREF(border_c));
+                let opf = SelectObject(hdc, frame);
+                MoveToEx(hdc, 0, 0, None); LineTo(hdc, w-1, 0);
+                LineTo(hdc, w-1, h-1); LineTo(hdc, 0, h-1); LineTo(hdc, 0, 0);
+                SelectObject(hdc, opf); DeleteObject(frame);
+                // 色塊：選取色為完整格大小（含橙色框），未選取縮小居中
+                const INSET: i32 = 3; // 未選取色塊每邊內縮量
                 for i in 0..12i32 {
                     let col = i % COLS3; let row = i / COLS3;
                     let x = PAD3 + col * (SW3 + SG3); let y = PAD3 + row * (SW3 + SG3);
                     let b = CreateSolidBrush(COLORREF(PALETTE3[i as usize]));
-                    let (bw, bc) = if i == st.cur_color_idx { (2i32, 0x00_D4_78_00u32) } else { (1, 0x00_A0_A0_A0) };
-                    let p = CreatePen(PS_SOLID, bw, COLORREF(bc));
-                    let ob = SelectObject(hdc, b); let op = SelectObject(hdc, p);
-                    GdiRectangle(hdc, x, y, x + SW3, y + SW3);
-                    SelectObject(hdc, ob); SelectObject(hdc, op);
-                    DeleteObject(b); DeleteObject(p);
+                    if i == st.cur_color_idx {
+                        let p = CreatePen(PS_SOLID, 1, COLORREF(0x00_D4_78_00u32));
+                        let ob = SelectObject(hdc, b); let op = SelectObject(hdc, p);
+                        GdiRectangle(hdc, x, y, x + SW3, y + SW3);
+                        SelectObject(hdc, ob); SelectObject(hdc, op);
+                        DeleteObject(p);
+                    } else {
+                        FillRect(hdc, &RECT{
+                            left: x + INSET, top: y + INSET,
+                            right: x + SW3 - INSET, bottom: y + SW3 - INSET,
+                        }, b);
+                    }
+                    DeleteObject(b);
                 }
                 // 「自訂顏色…」列
                 let font = GetStockObject(DEFAULT_GUI_FONT);
                 let of = SelectObject(hdc, font);
                 SetBkMode(hdc, BACKGROUND_MODE(1));
-                SetTextColor(hdc, windows::Win32::Foundation::COLORREF(0x00_30_30_30));
+                SetTextColor(hdc, windows::Win32::Foundation::COLORREF(tc.tab_text_active));
                 let mut s1 = crate::i18n::tw("自訂顏色…", "Custom Color…");
                 let mut r1 = RECT { left: PAD3, top: st.cc_y + 3,
                     right: rc.right - PAD3, bottom: st.cc_y + CCV3 };
                 DrawTextW(hdc, &mut s1, &mut r1, DRAW_TEXT_FORMAT(0x00));
-                // 分隔線
-                let sep = CreatePen(PS_SOLID, 1, COLORREF(0x00_C0_C0_C0));
+                // 分隔線（與外框同色）
+                let sep = CreatePen(PS_SOLID, 1, COLORREF(border_c));
                 let op = SelectObject(hdc, sep);
                 MoveToEx(hdc, PAD3, st.thick_y - 4, None);
                 LineTo(hdc, rc.right - PAD3, st.thick_y - 4);
                 SelectObject(hdc, op); DeleteObject(sep);
-                // 橫線預覽（平頭端點，垂直置中）—— 顏色跟隨目前設定
+                // 輸入框淡色外框
+                let input_c = if dark { 0x00_77_77_77u32 } else { 0x00_A0_A0_A0u32 };
+                let ep = CreatePen(PS_SOLID, 1, COLORREF(input_c));
+                let ope = SelectObject(hdc, ep);
+                let ex = PAD3 - 1; let ey = st.thick_y + 1;
+                let er = PAD3 + EW3; let eb = st.thick_y + TH3 - 2;
+                MoveToEx(hdc, ex, ey, None);
+                LineTo(hdc, er, ey); LineTo(hdc, er, eb); LineTo(hdc, ex, eb); LineTo(hdc, ex, ey);
+                SelectObject(hdc, ope); DeleteObject(ep);
+                // 橫線預覽
                 let t = st.preview_thick.clamp(1, 16);
                 let lx = PAD3 + EW3 + 8;
                 let ly = st.thick_y + TH3 / 2;
@@ -2739,7 +2794,21 @@ unsafe fn simple_color_dialog(owner: HWND, cur_color: u32, cur_thickness: i32) -
                 }
                 LRESULT(0)
             }
+            0x0133 => { // WM_CTLCOLOREDIT
+                let st = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CState);
+                if st.bg_brush != 0 {
+                    let hdc = windows::Win32::Graphics::Gdi::HDC(wp.0 as *mut _);
+                    SetTextColor(hdc, COLORREF(crate::theme::colors().tab_text_active));
+                    SetBkMode(hdc, BACKGROUND_MODE(1));
+                    return LRESULT(st.bg_brush);
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_DESTROY => {
+                let st = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const CState);
+                if st.bg_brush != 0 {
+                    DeleteObject(windows::Win32::Graphics::Gdi::HBRUSH(st.bg_brush as *mut _));
+                }
                 KillTimer(hwnd, TIMER_OUTSIDE3);
                 LRESULT(0)
             }
@@ -2749,6 +2818,7 @@ unsafe fn simple_color_dialog(owner: HWND, cur_color: u32, cur_thickness: i32) -
 
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        style: CS_DROPSHADOW,
         lpfnWndProc: Some(drop_proc), hInstance: hinstance, lpszClassName: class,
         hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
         ..Default::default()
@@ -2764,10 +2834,11 @@ unsafe fn simple_color_dialog(owner: HWND, cur_color: u32, cur_thickness: i32) -
         preview_color: cur_color,
         edit_hwnd: 0,
         initial_btn_released: false,
+        bg_brush: 0,
     };
     let drop = CreateWindowExW(
         WS_EX_TOPMOST, class, w!(""),
-        WS_POPUP | WS_BORDER | WS_VISIBLE,
+        WS_POPUP | WS_VISIBLE,
         btn_rc.left, btn_rc.bottom, win_w, win_h,
         owner, HMENU(std::ptr::null_mut()), hinstance,
         Some(&mut state as *mut _ as _),
@@ -3128,17 +3199,17 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
                         ds.bg_brush = CreateSolidBrush(COLORREF(crate::theme::colors().toolbar_bg)).0 as isize;
                         // 數字輸入框（ID=100, ES_NUMBER=0x2000）
                         let edit = CreateWindowExW(Default::default(), w!("EDIT"), w!(""),
-                            WS_CHILD|WS_VISIBLE|WS_BORDER|WINDOW_STYLE(0x2000u32),
-                            8, TH+34, 80, 26, hwnd, HMENU(100usize as _), hi, None)
+                            WS_CHILD|WS_VISIBLE|WINDOW_STYLE(0x2000u32),
+                            8, TH+34, 80, 18, hwnd, HMENU(100usize as _), hi, None)
                             .unwrap_or(HWND(std::ptr::null_mut()));
                         // 確定（ID=1, BS_OWNERDRAW → 主要藍色按鈕）
                         CreateWindowExW(Default::default(), w!("BUTTON"), w!("確定"),
                             WS_CHILD|WS_VISIBLE|WINDOW_STYLE(0x0000000Bu32),
-                            8, TH+70, 80, 28, hwnd, HMENU(1usize as _), hi, None).ok();
+                            8, TH+62, 80, 28, hwnd, HMENU(1usize as _), hi, None).ok();
                         // 取消（ID=2, BS_OWNERDRAW）
                         CreateWindowExW(Default::default(), w!("BUTTON"), w!("取消"),
                             WS_CHILD|WS_VISIBLE|WINDOW_STYLE(0x0000000Bu32),
-                            100, TH+70, 80, 28, hwnd, HMENU(2usize as _), hi, None).ok();
+                            100, TH+62, 80, 28, hwnd, HMENU(2usize as _), hi, None).ok();
                         if !edit.0.is_null() {
                             let pre: Vec<u16> = format!("{}\0", ds.value).encode_utf16().collect();
                             SetWindowTextW(edit, windows::core::PCWSTR(pre.as_ptr())).ok();
@@ -3176,6 +3247,13 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
                         let mut xw = [0x00D7u16];
                         let mut xrc = RECT{left:w-28,top:0,right:w-2,bottom:TH};
                         DrawTextW(hdc, &mut xw, &mut xrc, DRAW_TEXT_FORMAT(0x25));
+                        // 輸入框淡色外框
+                        let input_c = if dark { 0x00_77_77_77u32 } else { 0x00_A0_A0_A0u32 };
+                        let ep = CreatePen(PS_SOLID, 1, COLORREF(input_c));
+                        let ope = SelectObject(hdc, ep);
+                        MoveToEx(hdc, 7, TH+33, None);
+                        LineTo(hdc, 88, TH+33); LineTo(hdc, 88, TH+52); LineTo(hdc, 7, TH+52); LineTo(hdc, 7, TH+33);
+                        SelectObject(hdc, ope); DeleteObject(ep);
                         SetTextColor(hdc, COLORREF(tc.tab_text_active));
                         let mut lbl: Vec<u16> = crate::i18n::t("延遲秒數（0–99）：","Delay seconds (0–99):").encode_utf16().collect();
                         let mut lrc = RECT{left:8, top:TH+8, right:w-8, bottom:TH+30};
@@ -3261,7 +3339,7 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
             let mut ds = DS { value: current, confirmed: false, done: false, bg_brush: 0 };
             let mut pr = RECT::default();
             GetWindowRect(hwnd, &mut pr).ok();
-            let (dlg_w, dlg_h) = (220i32, 140i32);
+            let (dlg_w, dlg_h) = (220i32, 132i32);
             let px = (pr.left + pr.right) / 2 - dlg_w / 2;
             let py = (pr.top + pr.bottom) / 2 - dlg_h / 2;
             let dlg = CreateWindowExW(
