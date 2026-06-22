@@ -30,6 +30,7 @@ static PICK_MOUSE_HWND: AtomicIsize = AtomicIsize::new(0);
 struct RegionState {
     tx: Sender<AppEvent>,
     dragging: bool,
+    has_cursor: bool,
     start_x: i32,
     start_y: i32,
     cur_x: i32,
@@ -56,6 +57,7 @@ pub fn show_region(tx: Sender<AppEvent>) {
         let state = Box::new(RegionState {
             tx,
             dragging: false,
+            has_cursor: false,
             start_x: 0,
             start_y: 0,
             cur_x: 0,
@@ -140,13 +142,12 @@ unsafe extern "system" fn region_wnd_proc(
         }
         WM_MOUSEMOVE => {
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RegionState);
-            if state.dragging {
-                let (x, y) = cursor_screen_pos();
-                state.cur_x = x;
-                state.cur_y = y;
-                InvalidateRect(hwnd, None, true);
-                UpdateWindow(hwnd);
-            }
+            let (x, y) = cursor_screen_pos();
+            state.cur_x = x;
+            state.cur_y = y;
+            state.has_cursor = true;
+            InvalidateRect(hwnd, None, true);
+            UpdateWindow(hwnd);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -178,10 +179,21 @@ unsafe extern "system" fn region_wnd_proc(
             FillRect(hdc, &full, bg);
             DeleteObject(bg);
 
+            let ovx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let ovy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+            // 縱橫輔助線：一進入選取模式游標移動就顯示
+            if state.has_cursor {
+                let cx = state.cur_x - ovx;
+                let cy = state.cur_y - ovy;
+                let ch_b = CreateSolidBrush(COLORREF(0x00_80_80_80));
+                FillRect(hdc, &RECT { left: 0, top: cy, right: full.right, bottom: cy + 1 }, ch_b);
+                FillRect(hdc, &RECT { left: cx, top: 0, right: cx + 1, bottom: full.bottom }, ch_b);
+                DeleteObject(ch_b);
+            }
+
             if state.dragging {
                 let r = normalise(state.start_x, state.start_y, state.cur_x, state.cur_y);
-                let ovx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-                let ovy = GetSystemMetrics(SM_YVIRTUALSCREEN);
                 let l  = r.left   - ovx;
                 let t  = r.top    - ovy;
                 let ri = r.right  - ovx;

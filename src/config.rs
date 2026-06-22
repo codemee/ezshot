@@ -92,6 +92,51 @@ pub fn persist_settings(config: &Config) {
     }
 }
 
+// ── 開機自動執行（HKCU Run 機碼）────────────────────────────────────────
+
+const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const RUN_VAL: &str = "ezshot";
+
+pub fn is_startup_with_windows() -> bool {
+    unsafe {
+        use windows::Win32::System::Registry::*;
+        use windows::core::PCWSTR;
+        let key: Vec<u16> = format!("{}\0", RUN_KEY).encode_utf16().collect();
+        let val: Vec<u16> = format!("{}\0", RUN_VAL).encode_utf16().collect();
+        let mut cb = 0u32;
+        // RegGetValueW 若值不存在回傳錯誤；存在則 cb > 0
+        let r = RegGetValueW(
+            HKEY_CURRENT_USER, PCWSTR(key.as_ptr()), PCWSTR(val.as_ptr()),
+            RRF_RT_REG_SZ, None, None, Some(&mut cb),
+        );
+        r.is_ok() || cb > 0
+    }
+}
+
+pub fn set_startup_with_windows(enabled: bool) {
+    unsafe {
+        use windows::Win32::System::Registry::*;
+        use windows::core::PCWSTR;
+        let key: Vec<u16> = format!("{}\0", RUN_KEY).encode_utf16().collect();
+        let val: Vec<u16> = format!("{}\0", RUN_VAL).encode_utf16().collect();
+        let mut hkey = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(key.as_ptr()),
+            0, KEY_SET_VALUE, &mut hkey).is_err() { return; }
+        if enabled {
+            if let Ok(exe) = std::env::current_exe() {
+                let path_str = exe.to_string_lossy().to_string();
+                let path_w: Vec<u16> = path_str.encode_utf16().chain(Some(0)).collect();
+                let bytes = std::slice::from_raw_parts(
+                    path_w.as_ptr() as *const u8, path_w.len() * 2);
+                let _ = RegSetValueExW(hkey, PCWSTR(val.as_ptr()), 0, REG_SZ, Some(bytes));
+            }
+        } else {
+            let _ = RegDeleteValueW(hkey, PCWSTR(val.as_ptr()));
+        }
+        let _ = RegCloseKey(hkey);
+    }
+}
+
 // ── 共用輔助 ───────────────────────────────────────────────────────────
 
 fn config_dir() -> Option<PathBuf> {

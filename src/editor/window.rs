@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Gdi::{
     DrawTextW, EndPaint, FillRect, FillRgn, GetDC, GetStockObject,
     IntersectClipRect, InvalidateRect,
     Arc as GdiArc, Ellipse, LineTo, MoveToEx, NULL_BRUSH, Polygon, Polyline,
-    Rectangle as GdiRectangle, ReleaseDC, RestoreDC, RoundRect, SaveDC,
+    Rectangle as GdiRectangle, ReleaseDC, RestoreDC, SaveDC,
     SelectObject, SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt,
     BACKGROUND_MODE, DEFAULT_GUI_FONT, DRAW_TEXT_FORMAT, HRGN, PAINTSTRUCT,
     PS_SOLID, SRCCOPY, STRETCH_BLT_MODE,
@@ -48,6 +48,7 @@ const CM_DELAY_0:  u32 = 3200; const CM_DELAY_1: u32 = 3201;
 const CM_DELAY_2:  u32 = 3202; const CM_DELAY_3: u32 = 3203;
 const CM_DELAY_5:  u32 = 3205; const CM_DELAY_CUSTOM: u32 = 3210;
 const CM_TOGGLE_HIDE_ON_CAPTURE: u32 = 3012;
+const CM_TOGGLE_STARTUP:         u32 = 3013;
 const CM_LANG_AUTO: u32 = 3300;
 const CM_LANG_ZH:   u32 = 3301;
 const CM_LANG_EN:   u32 = 3302;
@@ -217,6 +218,9 @@ pub fn open(
             Ok(h) => h,
             Err(_) => return,
         };
+
+        // 深色標題列 + 捲軸主題
+        apply_dark_frame(hwnd);
 
         // 設定與系統匣相同的視窗圖示
         let app_icon = crate::icon::create_app_icon();
@@ -515,6 +519,75 @@ fn cursor_for_crop_handle(handle: CropHandle) -> windows::core::PCWSTR {
         CropHandle::Top | CropHandle::Bottom => IDC_SIZENS,
         CropHandle::Left | CropHandle::Right => IDC_SIZEWE,
     }
+}
+
+// 反色 I 型文字游標（AND=1 全部，XOR=I 形 → 在任何背景色上反色顯示）
+static TEXT_CURSOR_RAW: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+unsafe fn get_text_cursor() -> HCURSOR {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::UI::WindowsAndMessaging::CreateCursor;
+    let cached = TEXT_CURSOR_RAW.load(Ordering::Relaxed);
+    if cached != 0 {
+        return HCURSOR(cached as *mut _);
+    }
+    // 32×32；保留 8 列透明邊距使高度近似系統游標（16 列可見）
+    // 橫線 5px 對稱（欄 13-17，hotspot 欄 15 兩側各 2px），縱線 1px
+    let and_mask = [0xFFu8; 32 * 4];
+    let mut xor_mask = [0x00u8; 32 * 4];
+    for row in [8usize, 9, 22, 23] { // 上下橫線（欄 13-17）
+        xor_mask[row * 4 + 1] = 0x07; // 欄 13-15
+        xor_mask[row * 4 + 2] = 0xC0; // 欄 16-17
+    }
+    for row in 10..22usize { // 縱線（1px，欄 15）
+        xor_mask[row * 4 + 1] = 0x01; // 欄 15
+    }
+    let cursor = CreateCursor(None, 15, 15, 32, 32,
+        and_mask.as_ptr() as *const _, xor_mask.as_ptr() as *const _,
+    ).unwrap_or_else(|_| LoadCursorW(None, IDC_CROSS).unwrap_or_default());
+    TEXT_CURSOR_RAW.store(cursor.0 as usize, Ordering::Relaxed);
+    cursor
+}
+
+unsafe fn apply_dark_frame(hwnd: HWND) {
+    let dark = crate::theme::current() == crate::theme::Theme::Dark;
+    // 深色標題列（DWMWA_USE_IMMERSIVE_DARK_MODE = 20）
+    {
+        use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
+        let val = BOOL(if dark { 1 } else { 0 });
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWINDOWATTRIBUTE(20),
+            &val as *const BOOL as *const std::ffi::c_void,
+            std::mem::size_of::<BOOL>() as u32,
+        );
+    }
+    // AllowDarkModeForWindow（ordinal 133）+ 深色捲軸主題
+    {
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        use windows::core::{PCSTR, PCWSTR};
+        let name: Vec<u16> = "uxtheme.dll\0".encode_utf16().collect();
+        if let Ok(hmod) = LoadLibraryW(PCWSTR(name.as_ptr())) {
+            if let Some(f) = GetProcAddress(hmod, PCSTR(133usize as *const u8)) {
+                let allow: unsafe extern "system" fn(HWND, BOOL) -> BOOL =
+                    std::mem::transmute(f);
+                allow(hwnd, BOOL(if dark { 1 } else { 0 }));
+            }
+        }
+        if dark {
+            let _ = windows::Win32::UI::Controls::SetWindowTheme(
+                hwnd, w!("DarkMode_Explorer"), PCWSTR(std::ptr::null()),
+            );
+        } else {
+            let _ = windows::Win32::UI::Controls::SetWindowTheme(
+                hwnd, PCWSTR(std::ptr::null()), PCWSTR(std::ptr::null()),
+            );
+        }
+    }
+    // 強制重新計算非客戶區，讓捲軸顏色立即生效
+    SetWindowPos(hwnd, None, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED).ok();
 }
 
 unsafe extern "system" fn editor_wnd_proc(
@@ -1252,7 +1325,11 @@ unsafe extern "system" fn editor_wnd_proc(
             } // end if ps.rcPaint.top < CANVAS_Y
 
             // 只有更新區域涵蓋畫布時才做昂貴的 Canvas::render
-            if ps.rcPaint.bottom > CANVAS_Y && !state.tabs.is_empty() {
+            if ps.rcPaint.bottom > CANVAS_Y && state.tabs.is_empty() {
+                let gray = CreateSolidBrush(COLORREF(crate::theme::colors().canvas_bg));
+                FillRect(hdc, &RECT { left: 0, top: CANVAS_Y, right: client_w.max(1), bottom: rc.bottom }, gray);
+                DeleteObject(gray);
+            } else if ps.rcPaint.bottom > CANVAS_Y {
                 let screen_dc = GetDC(HWND(std::ptr::null_mut()));
 
                 let buf_dc  = CreateCompatibleDC(screen_dc);
@@ -1312,27 +1389,32 @@ unsafe extern "system" fn editor_wnd_proc(
             let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const EditorState);
 
             let is_pressed   = (dis.itemState.0 & 0x0001) != 0; // ODS_SELECTED
-            let is_active_tool =
+            // 無分頁時，需要畫布才能操作的按鈕顯示為禁用狀態
+            let canvas_disabled = state.tabs.is_empty() && matches!(id,
+                BTN_PEN | BTN_ARROW | BTN_RECT | BTN_TEXT | BTN_MOSAIC |
+                BTN_COPY | BTN_SAVE | BTN_SAVEAS | BTN_UNDO | BTN_ZOOM_IN | BTN_ZOOM_OUT);
+
+            let is_active_tool = !state.tabs.is_empty() && (
                 (id == BTN_PEN   && state.active_tool == Tool::Pen)   ||
                 (id == BTN_ARROW && state.active_tool == Tool::Arrow)  ||
                 (id == BTN_RECT  && state.active_tool == Tool::Rect)   ||
                 (id == BTN_TEXT  && state.active_tool == Tool::Text)   ||
-                (id == BTN_MOSAIC && state.active_tool == Tool::Mosaic);
+                (id == BTN_MOSAIC && state.active_tool == Tool::Mosaic));
 
             // COLORREF = 0x00BBGGRR
-            let bg = if is_pressed {
+            let bg = if canvas_disabled {
+                COLORREF(crate::theme::colors().toolbar_bg)
+            } else if is_pressed {
                 windows::Win32::Foundation::COLORREF(0x00_22_22_22)
             } else if is_active_tool {
                 windows::Win32::Foundation::COLORREF(0x00_D4_78_00) // #0078D4 藍
             } else {
-                match id {
-                    _         => COLORREF(crate::theme::colors().toolbar_bg), // 與工具列同色，只顯示圖示
-                }
+                COLORREF(crate::theme::colors().toolbar_bg)
             };
-            let saveas_disabled = id == BTN_SAVEAS
-                && (state.tabs.is_empty() || state.tabs[state.active_tab].saved_path.is_none());
+            let saveas_disabled = !canvas_disabled && id == BTN_SAVEAS
+                && state.tabs[state.active_tab].saved_path.is_none();
             let text_color = match id {
-                _ if saveas_disabled => windows::Win32::Foundation::COLORREF(0x00_C0_C0_C0), // 禁用灰
+                _ if canvas_disabled || saveas_disabled => COLORREF(0x00_80_80_80), // 禁用灰
                 _ if is_active_tool || is_pressed => windows::Win32::Foundation::COLORREF(0x00_FF_FF_FF),
                 _ => windows::Win32::Foundation::COLORREF(crate::theme::colors().btn_icon),
             };
@@ -1559,15 +1641,14 @@ unsafe extern "system" fn editor_wnd_proc(
                     let state = &*ptr;
                     // hovering_canvas 由 WM_MOUSEMOVE 維護，避免使用不在 glob 中的 ScreenToClient
                     if state.hovering_canvas {
-                        let cursor_id = if let Some(handle) = state.crop_handle.or(state.hover_crop_handle) {
-                            cursor_for_crop_handle(handle)
+                        let cursor = if let Some(handle) = state.crop_handle.or(state.hover_crop_handle) {
+                            LoadCursorW(None, cursor_for_crop_handle(handle)).unwrap()
+                        } else if matches!(state.active_tool, Tool::Text) {
+                            get_text_cursor()
                         } else {
-                            match state.active_tool {
-                                Tool::Text => IDC_IBEAM,
-                                _          => IDC_CROSS,
-                            }
+                            LoadCursorW(None, IDC_CROSS).unwrap()
                         };
-                        SetCursor(LoadCursorW(None, cursor_id).unwrap());
+                        SetCursor(cursor);
                         return LRESULT(1);
                     }
                 }
@@ -1582,6 +1663,7 @@ unsafe extern "system" fn editor_wnd_proc(
         }
         // 主題已由系統匣變更 → 全視窗重繪
         WM_THEME_CHANGED => {
+            apply_dark_frame(hwnd);
             InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
@@ -1727,7 +1809,7 @@ unsafe fn flat_dlg_drawbtn(lp: LPARAM) {
     let pen = CreatePen(PS_SOLID, 1, COLORREF(border_c));
     let brush = CreateSolidBrush(COLORREF(bg_c));
     let op = SelectObject(hdc, pen); let ob = SelectObject(hdc, brush);
-    RoundRect(hdc, r.left, r.top, r.right, r.bottom, 5, 5);
+    GdiRectangle(hdc, r.left, r.top, r.right, r.bottom);
     SelectObject(hdc, op); SelectObject(hdc, ob);
     DeleteObject(pen); DeleteObject(brush);
     SetBkMode(hdc, BACKGROUND_MODE(1));
@@ -1793,7 +1875,7 @@ unsafe fn close_tab_with_confirm(hwnd: HWND, state: &mut EditorState, idx: usize
                 _ => DefWindowProcW(hwnd, msg, wp, lp),
             }
         }
-        let wc = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, style: CS_DROPSHADOW, lpfnWndProc: Some(dp), hInstance: hinstance, lpszClassName: class, ..Default::default() };
+        let wc = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, style: CS_DROPSHADOW, lpfnWndProc: Some(dp), hInstance: hinstance, lpszClassName: class, hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(), ..Default::default() };
         let _ = RegisterClassExW(&wc);
         let dlg_w = 360i32; let dlg_h = 104i32;
         let (px, py) = { let mut pr = RECT::default(); GetWindowRect(hwnd, &mut pr).ok(); ((pr.left+pr.right)/2 - dlg_w/2, (pr.top+pr.bottom)/2 - dlg_h/2) };
@@ -1954,7 +2036,7 @@ unsafe fn confirm_save_tab_dialog(parent: HWND, tab_name: &str) -> ConfirmSaveRe
         }
     }
 
-    let wc = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, style: CS_DROPSHADOW, lpfnWndProc: Some(dp), hInstance: hinstance, lpszClassName: class, ..Default::default() };
+    let wc = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, style: CS_DROPSHADOW, lpfnWndProc: Some(dp), hInstance: hinstance, lpszClassName: class, hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(), ..Default::default() };
     let _ = RegisterClassExW(&wc);
     let dlg_w = 460i32; let dlg_h = 104i32;
     let (px, py) = { let mut pr = RECT::default(); GetWindowRect(parent, &mut pr).ok(); ((pr.left+pr.right)/2 - dlg_w/2, (pr.top+pr.bottom)/2 - dlg_h/2) };
@@ -2090,13 +2172,14 @@ unsafe extern "system" fn flat_combo_subproc(hwnd: HWND, msg: u32, wp: WPARAM, l
                 DeleteObject(tri_brush);
                 DeleteObject(tri_pen);
 
-                // 1px 扁平外框
+                // 1px 扁平外框（跳過四個角落像素，避免孤立黑點）
                 let pen = CreatePen(PS_SOLID, 1, COLORREF(border));
                 let op  = SelectObject(hdc, pen);
-                let ob  = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                GdiRectangle(hdc, 0, 0, cw, ch);
+                MoveToEx(hdc, 1,      0,      None); LineTo(hdc, cw - 1, 0);      // 上
+                MoveToEx(hdc, 1,      ch - 1, None); LineTo(hdc, cw - 1, ch - 1); // 下
+                MoveToEx(hdc, 0,      1,      None); LineTo(hdc, 0,      ch - 1); // 左
+                MoveToEx(hdc, cw - 1, 1,      None); LineTo(hdc, cw - 1, ch - 1); // 右
                 SelectObject(hdc, op);
-                SelectObject(hdc, ob);
                 DeleteObject(pen);
                 ReleaseDC(hwnd, hdc);
             }
@@ -2373,6 +2456,7 @@ unsafe fn simple_input_dialog(
         lpfnWndProc: Some(input_wnd_proc),
         hInstance: hinstance,
         lpszClassName: class,
+        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
         ..Default::default()
     };
     let _ = RegisterClassExW(&wc);
@@ -2666,6 +2750,7 @@ unsafe fn simple_color_dialog(owner: HWND, cur_color: u32, cur_thickness: i32) -
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(drop_proc), hInstance: hinstance, lpszClassName: class,
+        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
         ..Default::default()
     };
     let _ = RegisterClassExW(&wc);
@@ -2816,6 +2901,10 @@ unsafe fn show_settings_popup(hwnd: HWND, state: &EditorState, sx: i32, sy: i32)
     let _ = AppendMenuW(hmenu, af, CM_TOGGLE_AUTOCOPY as usize, windows::core::PCWSTR(sa.as_ptr()));
     let hf = if hide_on_capture { MF_STRING | MF_CHECKED } else { MF_STRING };
     let _ = AppendMenuW(hmenu, hf, CM_TOGGLE_HIDE_ON_CAPTURE as usize, windows::core::PCWSTR(sh.as_ptr()));
+    let startup = crate::config::is_startup_with_windows();
+    let ss = tw("Windows 啟動時自動執行", "Run at Windows Startup");
+    let sf = if startup { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(hmenu, sf, CM_TOGGLE_STARTUP as usize, windows::core::PCWSTR(ss.as_ptr()));
 
     let s_delay_title = tw("延遲擷取", "Capture Delay");
     let delay_menu = CreatePopupMenu().unwrap();
@@ -2964,6 +3053,10 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
             c.hide_editor_on_capture = !c.hide_editor_on_capture;
             crate::config::persist_settings(&c);
         }
+        CM_TOGGLE_STARTUP => {
+            let cur = crate::config::is_startup_with_windows();
+            crate::config::set_startup_with_windows(!cur);
+        }
         CM_LANG_AUTO => {
             let mut c = state.config.lock().unwrap();
             c.language = "auto".to_string();
@@ -2987,6 +3080,7 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
             c.theme = "auto".to_string();
             crate::config::persist_settings(&c);
             crate::theme::init("auto");
+            apply_dark_frame(hwnd);
             InvalidateRect(hwnd, None, false);
         }
         CM_THEME_LIGHT => {
@@ -2994,6 +3088,7 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
             c.theme = "light".to_string();
             crate::config::persist_settings(&c);
             crate::theme::set(crate::theme::Theme::Light);
+            apply_dark_frame(hwnd);
             InvalidateRect(hwnd, None, false);
         }
         CM_THEME_DARK => {
@@ -3001,6 +3096,7 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
             c.theme = "dark".to_string();
             crate::config::persist_settings(&c);
             crate::theme::set(crate::theme::Theme::Dark);
+            apply_dark_frame(hwnd);
             InvalidateRect(hwnd, None, false);
         }
         CM_DELAY_0 | CM_DELAY_1 | CM_DELAY_2 | CM_DELAY_3 | CM_DELAY_5 => {
@@ -3015,7 +3111,7 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
             let config_arc = state.config.clone();
             let class = w!("srcshot_delaydlg2");
             let hinstance = get_instance();
-            struct DS { value: u32, confirmed: bool, done: bool }
+            struct DS { value: u32, confirmed: bool, done: bool, bg_brush: isize }
             unsafe extern "system" fn dp(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 const TH: i32 = 36;
                 match msg {
@@ -3027,7 +3123,9 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
                     WM_CREATE => {
                         let hi = get_instance();
                         let cs = &*(lp.0 as *const CREATESTRUCTW);
-                        let ds = &*(cs.lpCreateParams as *const DS);
+                        let ds = &mut *(cs.lpCreateParams as *mut DS);
+                        // 建立背景刷供 WM_CTLCOLOREDIT 使用（深淺主題皆需）
+                        ds.bg_brush = CreateSolidBrush(COLORREF(crate::theme::colors().toolbar_bg)).0 as isize;
                         // 數字輸入框（ID=100, ES_NUMBER=0x2000）
                         let edit = CreateWindowExW(Default::default(), w!("EDIT"), w!(""),
                             WS_CHILD|WS_VISIBLE|WS_BORDER|WINDOW_STYLE(0x2000u32),
@@ -3087,6 +3185,17 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
                         LRESULT(0)
                     }
                     WM_DRAWITEM => { flat_dlg_drawbtn(lp); LRESULT(1) }
+                    // EDIT 控制項詢問父視窗要用什麼背景色
+                    0x0133 => {
+                        let s = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const DS);
+                        if s.bg_brush != 0 {
+                            let edit_hdc = windows::Win32::Graphics::Gdi::HDC(wp.0 as *mut _);
+                            SetTextColor(edit_hdc, COLORREF(crate::theme::colors().tab_text_active));
+                            SetBkMode(edit_hdc, BACKGROUND_MODE(1));
+                            return LRESULT(s.bg_brush);
+                        }
+                        DefWindowProcW(hwnd, msg, wp, lp)
+                    }
                     WM_NCHITTEST => {
                         let sy = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
                         let sx = (lp.0 & 0xFFFF) as i16 as i32;
@@ -3129,7 +3238,13 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
                         s.done = true; DestroyWindow(hwnd).ok();
                         LRESULT(0)
                     }
-                    WM_DESTROY => LRESULT(0),
+                    WM_DESTROY => {
+                        let s = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const DS);
+                        if s.bg_brush != 0 {
+                            DeleteObject(windows::Win32::Graphics::Gdi::HBRUSH(s.bg_brush as *mut _));
+                        }
+                        LRESULT(0)
+                    }
                     _ => DefWindowProcW(hwnd, msg, wp, lp),
                 }
             }
@@ -3139,10 +3254,11 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
                 lpfnWndProc: Some(dp),
                 hInstance: hinstance,
                 lpszClassName: class,
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
                 ..Default::default()
             };
             let _ = RegisterClassExW(&wc);
-            let mut ds = DS { value: current, confirmed: false, done: false };
+            let mut ds = DS { value: current, confirmed: false, done: false, bg_brush: 0 };
             let mut pr = RECT::default();
             GetWindowRect(hwnd, &mut pr).ok();
             let (dlg_w, dlg_h) = (220i32, 140i32);
