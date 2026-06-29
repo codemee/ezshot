@@ -255,6 +255,25 @@ Undo 系統採 `UndoOp` enum：
 - Tooltip 使用 `WS_EX_LAYERED | WS_EX_NOACTIVATE`，`SetWindowPos` 加 `SWP_NOACTIVATE`：
   不觸發下方 WM_PAINT，不搶奪焦點（避免編輯視窗陰影消失）
 
+### 標籤列捲動與拖曳排序
+
+**標籤捲動規則**：
+- `tab_scroll`：跳過左側幾個標籤的偏移量
+- WM_PAINT 開頭強制修正 `tab_scroll`：若剩餘標籤不足以填滿 `max_tabs_visible` 個格子，自動減小 `tab_scroll` 讓左側標籤補回（`scroll_max = tabs.len() - max_tabs_visible`）
+- 右側剪裁邊界 `tab_clip_right = client_w - DROP_W`（▼ 按鈕左側），允許渲染 `max_tabs_visible + 1` 個標籤，最右側超出裁切範圍者自然呈現部分可見
+- 點擊**部分可見**標籤：`tab_scroll = active_tab + 1 - max_vis`（使該標籤成為最後一個完整顯示）
+- 點擊**最左側**標籤（`slot == 0`）且 `tab_scroll > 0`：`tab_scroll -= 1`，顯示左側多一個標籤
+- WM_PAINT 狀態修改：此處 `state` 取 `&mut`（例外），確保 scroll 修正立即生效
+
+**標籤拖曳排序**（`EditorState` 新增欄位）：
+- `tab_drag_src: usize`、`tab_drag_start_x: i32`（-1 = 未追蹤）、`tab_drag_cur_x: i32`、`tab_dragging: bool`
+- 點擊標籤體（非 ×）後：`SetCapture(hwnd)` + 記錄 drag_src / start_x；移動超過 6px 門檻才進入 `tab_dragging = true`
+- WM_MOUSEMOVE：`tab_dragging` 時只刷標籤列區域，不進行畫布繪圖
+- WM_LBUTTONUP：計算 `insert_slot = (drag_cur_x + TAB_W/2) / TAB_W`，執行 `tabs.remove(src)` + `tabs.insert(dest, tab)`；取消拖曳時清除 `tab_drag_start_x = -1` 並 `ReleaseCapture()`
+- WM_PAINT 拖曳視覺（`tab_dragging` 時，在 RestoreDC 之後繪製）：
+  1. **幽靈標籤**（游標置中）：淺色圓角矩形（深色模式 `#605060`，亮色 `#C4C8F0`）+ 標籤名稱文字
+  2. **橘色插入指示線**（`#D47800`）：2px 垂直線，位於最近的 gap 處
+
 ### 分頁關閉確認流程
 
 未存分頁的判斷條件：`tab.modified || tab.saved_path.is_none()`（與紅點顯示邏輯一致）。

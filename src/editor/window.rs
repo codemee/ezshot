@@ -124,6 +124,11 @@ struct EditorState {
     config: std::sync::Arc<std::sync::Mutex<crate::config::Config>>,
     text_font: String,
     text_size: i32,
+    // 標籤拖曳排序
+    tab_drag_src: usize,   // 被拖曳的標籤索引
+    tab_drag_start_x: i32, // 開始拖曳的滑鼠 X（-1 表示未追蹤）
+    tab_drag_cur_x: i32,   // 目前拖曳的滑鼠 X
+    tab_dragging: bool,    // 是否已超過門檻、進入拖曳模式
 }
 
 pub fn open(
@@ -202,6 +207,10 @@ pub fn open(
             config: config.clone(),
             text_font: "微軟正黑體".to_string(),
             text_size: 24,
+            tab_drag_src: 0,
+            tab_drag_start_x: -1,
+            tab_drag_cur_x: 0,
+            tab_dragging: false,
         });
 
         let hwnd = match CreateWindowExW(
@@ -1022,6 +1031,9 @@ unsafe extern "system" fn editor_wnd_proc(
 
                 let tab_scr = state.tab_scroll.min(state.tabs.len().saturating_sub(1));
                 let vis_count = (tab_scr + max_vis).min(state.tabs.len()) - tab_scr;
+                // 是否有部分可見的下一個標籤（在 ▼ 按鈕左側）
+                let has_partial = (tab_scr + max_vis) < state.tabs.len()
+                    && cx < rc2.right - DROP_W2;
                 let slot = (cx / TAB_W) as usize;  // 點擊的視覺格子（0 起）
                 let idx = slot + tab_scr;           // 實際標籤索引
                 if slot < vis_count {
@@ -1032,10 +1044,30 @@ unsafe extern "system" fn editor_wnd_proc(
                     } else {
                         state.active_tab = idx;
                         state.dragging = false;
+                        // 開始追蹤標籤拖曳（超過門檻距離後才進入拖曳模式）
+                        state.tab_drag_src = idx;
+                        state.tab_drag_start_x = cx;
+                        state.tab_drag_cur_x = cx;
+                        state.tab_dragging = false;
+                        SetCapture(hwnd);
+                        // 點擊最左側標籤且左側還有隱藏標籤：往左捲一格
+                        if slot == 0 && state.tab_scroll > 0 {
+                            state.tab_scroll -= 1;
+                        }
                         update_scrollbars(hwnd, state);
                         update_window_title(hwnd, state);
                         InvalidateRect(hwnd, None, false);
                     }
+                } else if has_partial && slot == vis_count && idx < state.tabs.len() {
+                    // 點擊部分可見的標籤：選取並捲動使其完整顯示
+                    state.active_tab = idx;
+                    state.dragging = false;
+                    if state.active_tab >= state.tab_scroll + max_vis {
+                        state.tab_scroll = state.active_tab + 1 - max_vis;
+                    }
+                    update_scrollbars(hwnd, state);
+                    update_window_title(hwnd, state);
+                    InvalidateRect(hwnd, None, false);
                 }
                 return LRESULT(0);
             }
@@ -1110,6 +1142,17 @@ unsafe extern "system" fn editor_wnd_proc(
             } else {
                 hit_crop_handle(&state.tabs[state.active_tab], cx_mm, cy_mm)
             };
+            // 標籤拖曳追蹤
+            if state.tab_drag_start_x >= 0 {
+                if !state.tab_dragging && (cx_mm - state.tab_drag_start_x).abs() >= 6 {
+                    state.tab_dragging = true;
+                }
+                if state.tab_dragging {
+                    state.tab_drag_cur_x = cx_mm;
+                    InvalidateRect(hwnd, Some(&RECT{left:0,top:TOOLBAR_H,right:32767,bottom:CANVAS_Y}), false);
+                    return LRESULT(0);
+                }
+            }
             if !state.dragging { return LRESULT(0); }
             let (cx, cy) = client_xy(lp);
             let zoom = state.tabs[state.active_tab].zoom;
@@ -1151,6 +1194,38 @@ unsafe extern "system" fn editor_wnd_proc(
         }
         WM_LBUTTONUP => {
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
+            // 標籤拖曳排序結束
+            if state.tab_dragging {
+                state.tab_dragging = false;
+                state.tab_drag_start_x = -1;
+                let _ = ReleaseCapture();
+                let tab_scroll = state.tab_scroll;
+                let mut rc2 = RECT::default();
+                GetClientRect(hwnd, &mut rc2).ok();
+                const DROP_W2: i32 = 22;
+                let max_vis = ((rc2.right - DROP_W2) / TAB_W).max(1) as usize;
+                let vis_count = (tab_scroll + max_vis + 1).min(state.tabs.len()) - tab_scroll;
+                // 計算插入位置（哪個 gap 最近）
+                let insert_slot = ((state.tab_drag_cur_x + TAB_W / 2) / TAB_W)
+                    .clamp(0, vis_count as i32) as usize;
+                let insert_idx = (insert_slot + tab_scroll).min(state.tabs.len());
+                let src = state.tab_drag_src;
+                // 只有移到不同位置才執行排序
+                if src < state.tabs.len() && insert_idx != src && insert_idx != src + 1 {
+                    let tab = state.tabs.remove(src);
+                    let dest = if insert_idx > src { insert_idx - 1 } else { insert_idx };
+                    state.tabs.insert(dest, tab);
+                    state.active_tab = dest;
+                    update_window_title(hwnd, state);
+                }
+                InvalidateRect(hwnd, None, false);
+                return LRESULT(0);
+            }
+            // 清除未達門檻的拖曳追蹤
+            if state.tab_drag_start_x >= 0 {
+                state.tab_drag_start_x = -1;
+                let _ = ReleaseCapture();
+            }
             if state.dragging {
                 state.dragging = false;
                 ReleaseCapture().unwrap();
@@ -1211,7 +1286,7 @@ unsafe extern "system" fn editor_wnd_proc(
             LRESULT(0)
         }
         WM_PAINT => {
-            let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
+            let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
 
@@ -1237,16 +1312,27 @@ unsafe extern "system" fn editor_wnd_proc(
             // 下拉按鈕寬度（標籤太多時顯示）
             const DROP_W: i32 = 22;
             let max_tabs_visible = ((client_w - DROP_W) / TAB_W).max(1) as usize;
-            let tab_scroll = state.tab_scroll.min(state.tabs.len().saturating_sub(1));
-            let visible_end = (tab_scroll + max_tabs_visible).min(state.tabs.len());
+            // 若 tab_scroll 過大導致右側留空，自動往左捲以填滿標籤列
+            if state.tabs.len() > max_tabs_visible {
+                let scroll_max = state.tabs.len() - max_tabs_visible;
+                if state.tab_scroll > scroll_max {
+                    state.tab_scroll = scroll_max;
+                }
+            } else {
+                state.tab_scroll = 0;
+            }
+            let tab_scroll = state.tab_scroll;
             let show_drop = state.tabs.len() > max_tabs_visible || tab_scroll > 0;
+            // 多渲染一個標籤（可能部分可見），裁切由 IntersectClipRect 自然截斷
+            let visible_end = (tab_scroll + max_tabs_visible + 1).min(state.tabs.len());
 
             let r = 8i32;  // 圓角半徑
             let ty = TOOLBAR_H + 2;
 
-            // 裁切到標籤列範圍，讓延伸超出的圓角底部自然被截斷
+            // 裁切到標籤列範圍，▼ 按鈕左側為右邊界，讓部分標籤自然截斷
+            let tab_clip_right = if show_drop { client_w - DROP_W } else { client_w };
             let saved_dc = SaveDC(hdc);
-            IntersectClipRect(hdc, 0, TOOLBAR_H, client_w.max(1), CANVAS_Y);
+            IntersectClipRect(hdc, 0, TOOLBAR_H, tab_clip_right.max(1), CANVAS_Y);
 
             for i in tab_scroll..visible_end {
                 let tab = &state.tabs[i];
@@ -1302,6 +1388,47 @@ unsafe extern "system" fn editor_wnd_proc(
             }
 
             RestoreDC(hdc, saved_dc);
+
+            // 標籤拖曳：插入指示線 + 跟隨游標的幽靈標籤
+            if state.tab_dragging {
+                let vis_count = visible_end - tab_scroll;
+                let insert_slot = ((state.tab_drag_cur_x + TAB_W / 2) / TAB_W)
+                    .clamp(0, vis_count as i32);
+                let ind_x = insert_slot * TAB_W;
+
+                // 幽靈標籤（淺色，跟隨游標）
+                if state.tab_drag_src < state.tabs.len() {
+                    let ghost_x = state.tab_drag_cur_x - TAB_W / 2;
+                    let dark = crate::theme::current() == crate::theme::Theme::Dark;
+                    let ghost_fill = if dark { 0x00_60_60_88u32 } else { 0x00_C4_C8_F0u32 };
+                    let ghost_text_c = if dark { 0x00_B8_B8_D0u32 } else { 0x00_40_44_88u32 };
+                    let gdc = SaveDC(hdc);
+                    IntersectClipRect(hdc, 0, TOOLBAR_H, client_w.max(1), CANVAS_Y);
+                    let ghost_rgn = CreateRoundRectRgn(ghost_x, ty, ghost_x + TAB_W, CANVAS_Y + r, r*2, r*2);
+                    let gb = CreateSolidBrush(COLORREF(ghost_fill));
+                    FillRgn(hdc, ghost_rgn, gb);
+                    DeleteObject(gb);
+                    DeleteObject(HRGN(ghost_rgn.0));
+                    SetBkMode(hdc, BACKGROUND_MODE(1));
+                    SetTextColor(hdc, COLORREF(ghost_text_c));
+                    let gfont = CreateFontW(-13, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, w!("Consolas"));
+                    let ogf = SelectObject(hdc, gfont);
+                    let mut gnw: Vec<u16> = state.tabs[state.tab_drag_src].name.encode_utf16().collect();
+                    let mut gnrc = RECT{left: ghost_x + 5, top: ty, right: ghost_x + TAB_W - 19, bottom: CANVAS_Y};
+                    DrawTextW(hdc, &mut gnw, &mut gnrc, DRAW_TEXT_FORMAT(0x25));
+                    SelectObject(hdc, ogf);
+                    DeleteObject(gfont);
+                    RestoreDC(hdc, gdc);
+                }
+
+                // 插入指示線（橘色垂直線）
+                let ind_p = CreatePen(PS_SOLID, 2, COLORREF(0x00_D4_78_00u32));
+                let op = SelectObject(hdc, ind_p);
+                MoveToEx(hdc, ind_x, TOOLBAR_H + 2, None);
+                LineTo(hdc, ind_x, CANVAS_Y - 2);
+                SelectObject(hdc, op);
+                DeleteObject(ind_p);
+            }
 
             // ▼ 下拉按鈕（分頁過多時）
             if show_drop {
